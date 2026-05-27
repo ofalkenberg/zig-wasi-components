@@ -1,0 +1,5 @@
+*~
+.swival
+.zig-cache
+zig-out
+target
