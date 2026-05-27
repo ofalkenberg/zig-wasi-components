@@ -1,0 +1,14 @@
+package demo:res@0.1.0;
+
+interface counters {
+  resource counter {
+    constructor(initial: u32);
+    increment: func();
+    add: func(n: u32);
+    get: func() -> u32;
+  }
+}
+
+world counts {
+  export counters;
+}

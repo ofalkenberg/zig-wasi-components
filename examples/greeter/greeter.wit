@@ -1,0 +1,108 @@
+package demo:greeter@0.1.0;
+
+world greeter {
+  /// 2-D point used to test record lifting across the canonical ABI.
+  record point {
+    x: s32,
+    y: s32,
+  }
+
+  /// Host-provided logger. The guest calls this when greeting; the
+  /// host collects every message it sees, demonstrating the Zig→Rust
+  /// direction of the canonical ABI.
+  import log: func(msg: string);
+
+  /// Host-provided import returning a `record` — flattens to two i32s,
+  /// so the canonical ABI passes the result through an indirect return
+  /// area allocated by the guest.
+  import origin: func() -> point;
+
+  /// Host-provided import taking a `record` as a parameter. The
+  /// record flattens to two flat slots (x: i32, y: i32) so the guest
+  /// lowers it directly into the flat representation, not through
+  /// a parameter memory area.
+  import label-point: func(p: point) -> string;
+
+  /// Returns the length of the name in bytes (post-canonical-ABI lift).
+  export greet: func(name: string) -> u32;
+
+  /// Sums a list of u32 — exercises `list<T>` lifting.
+  export sum: func(xs: list<u32>) -> u32;
+
+  /// Manhattan distance from origin. Exercises record parameter
+  /// lifting from flat core values.
+  export manhattan: func(p: point) -> u32;
+
+  /// Echo back a greeting string. Exercises indirect string return
+  /// (a return area in linear memory written by the guest).
+  export format-greeting: func(name: string) -> string;
+
+  /// A small tagged union sent back across the canonical ABI.
+  variant outcome {
+    ok-empty,
+    ok-value(u32),
+    fail(string),
+  }
+
+  /// Returns one of the three `outcome` cases depending on `n`.
+  /// Exercises variant lowering through the canonical memory layout.
+  export classify: func(n: s32) -> outcome;
+
+  /// Returns `option<u32>` — exercises the option discriminant +
+  /// payload layout in the return area.
+  export maybe-double: func(n: u32) -> option<u32>;
+
+  /// Returns `result<u32, string>` — exercises the result layout in
+  /// the return area.
+  export safe-divide: func(a: u32, b: u32) -> result<u32, string>;
+
+  /// Returns a tuple of two values, exercising tuple lowering in
+  /// the return area.
+  export pair: func(n: u32) -> tuple<u32, u32>;
+
+  /// Upcases a single Unicode scalar value. Exercises `char` in
+  /// both directions.
+  export upper-char: func(c: char) -> char;
+
+  /// 17 u32 parameters — exceeds MAX_FLAT_PARAMS=16 and is therefore
+  /// passed indirectly through a memory area allocated by the host.
+  export sum-many: func(
+    a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32,
+    a7: u32, a8: u32, a9: u32, a10: u32, a11: u32, a12: u32,
+    a13: u32, a14: u32, a15: u32, a16: u32,
+  ) -> u32;
+
+  /// Sum the Manhattan distances of every point in a list — proves
+  /// the canonical memory layout matches Zig's struct layout for
+  /// homogeneous-primitive records used as list elements.
+  export total-distance: func(points: list<point>) -> u32;
+
+  /// Three-bit bitset, backed by Zig's `packed struct(u8)`. The
+  /// canonical-ABI flat representation is a single i32, so lifting
+  /// must truncate from u32 down to the struct's backing width.
+  flags perms {
+    read,
+    write,
+    exec,
+  }
+
+  /// Population count of a perms value — exercises the flags lift.
+  export perms-popcount: func(p: perms) -> u32;
+
+  /// Tuple return. The two elements share a return area in the
+  /// canonical-ABI memory layout: `.0` at offset 0, `.1` at offset 4.
+  export divmod: func(a: u32, b: u32) -> tuple<u32, u32>;
+
+  /// `result<T, E>` used as an argument. The ok arm flattens to two
+  /// i32s (the string's pointer + length) and the err arm to one.
+  /// The trailing `fallback` parameter must be lifted from the slot
+  /// AFTER `max(ok_arity, err_arity)`, otherwise the buggy code
+  /// would read the string's length slot as the fallback.
+  export choose: func(r: result<string, u32>, fallback: u32) -> u32;
+
+  /// Calls back into the host's `origin` import and returns the
+  /// Manhattan distance between the host's origin and `p`. Proves
+  /// that an indirect-result import wrapper (`origin -> point`) is
+  /// usable from guest code.
+  export distance-from-origin: func(p: point) -> u32;
+}

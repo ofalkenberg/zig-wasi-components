@@ -1,0 +1,5 @@
+package demo:math@0.1.0;
+
+world math {
+    export add: func(a: u32, b: u32) -> u32;
+}

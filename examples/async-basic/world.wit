@@ -1,0 +1,39 @@
+package demo:asyncdemo@0.3.0;
+
+interface clock {
+    /// Host async function the guest calls. Returns a token based
+    /// on the input. Exercises `[async-lower]<func>` from the guest
+    /// side: SubtaskResult.unpack, waitable-set wait, subtask-drop.
+    tick: async func(value: u32) -> u32;
+}
+
+interface kit {
+    /// Async function that immediately returns the input value plus one.
+    /// Implemented synchronously on the guest side but driven through the
+    /// full async-with-callback canonical ABI: an `[async-lift]` export
+    /// invokes `[task-return]`, then signals EXIT.
+    succ: async func(value: u32) -> u32;
+
+    /// Async function that takes a string and returns its length, again
+    /// through the async ABI. Exercises string lifting + indirect
+    /// task.return when the input crosses cabi_realloc.
+    measure: async func(s: string) -> u32;
+
+    /// Creates a stream<u8>, writes some bytes into it, then returns
+    /// the readable end to the host. Exercises stream.new, stream.write,
+    /// and stream.drop-writable from the guest side.
+    greet: async func(name: string) -> stream<u8>;
+
+    /// Returns a future<u32> that is already resolved with the input
+    /// doubled. Exercises future.new, future.write, future.drop-writable.
+    promise: async func(value: u32) -> future<u32>;
+
+    /// Calls the imported host `tick(value)` and returns the result + 1.
+    /// Exercises the async-lower import path from the guest.
+    relay: async func(value: u32) -> u32;
+}
+
+world demo {
+    import clock;
+    export kit;
+}

@@ -1,0 +1,12 @@
+package demo:wasidemo@0.1.0;
+
+/// A wasi:cli `command` extended with the HTTP outgoing-handler and
+/// types imports. Combined with the standard `command` world this gives
+/// the guest access to stdio, environment variables, clocks, randomness
+/// and outbound HTTP — exactly the surface the `wasi` convenience
+/// module wraps.
+world demo {
+  include wasi:cli/command@0.2.6;
+  import wasi:http/outgoing-handler@0.2.6;
+  import wasi:http/types@0.2.6;
+}

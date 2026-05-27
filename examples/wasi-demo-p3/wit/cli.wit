@@ -1,0 +1,577 @@
+package wasi:cli@0.3.0;
+
+@since(version = 0.3.0)
+interface environment {
+  /// Get the POSIX-style environment variables.
+  ///
+  /// Each environment variable is provided as a pair of string variable names
+  /// and string value.
+  ///
+  /// Morally, these are a value import, but until value imports are available
+  /// in the component model, this import function should return the same
+  /// values each time it is called.
+  @since(version = 0.3.0)
+  get-environment: func() -> list<tuple<string, string>>;
+
+  /// Get the POSIX-style arguments to the program.
+  @since(version = 0.3.0)
+  get-arguments: func() -> list<string>;
+
+  /// Return a path that programs should use as their initial current working
+  /// directory, interpreting `.` as shorthand for this.
+  @since(version = 0.3.0)
+  get-initial-cwd: func() -> option<string>;
+}
+
+@since(version = 0.3.0)
+interface exit {
+  /// Exit the current instance and any linked instances.
+  @since(version = 0.3.0)
+  exit: func(status: result);
+
+  /// Exit the current instance and any linked instances, reporting the
+  /// specified status code to the host.
+  ///
+  /// The meaning of the code depends on the context, with 0 usually meaning
+  /// "success", and other values indicating various types of failure.
+  ///
+  /// This function does not return; the effect is analogous to a trap, but
+  /// without the connotation that something bad has happened.
+  @since(version = 0.3.0)
+  exit-with-code: func(status-code: u8);
+}
+
+@since(version = 0.3.0)
+interface run {
+  /// Run the program.
+  @since(version = 0.3.0)
+  run: async func() -> result;
+}
+
+@since(version = 0.3.0)
+interface types {
+  @since(version = 0.3.0)
+  enum error-code {
+    /// Input/output error
+    io,
+    /// Invalid or incomplete multibyte or wide character
+    illegal-byte-sequence,
+    /// Broken pipe
+    pipe,
+  }
+}
+
+@since(version = 0.3.0)
+interface stdin {
+  use types.{error-code};
+
+  /// Return a stream for reading from stdin.
+  ///
+  /// This function returns a stream which provides data read from stdin,
+  /// and a future to signal read results.
+  ///
+  /// If the stream's readable end is dropped the future will resolve to success.
+  ///
+  /// If the stream's writable end is dropped the future will either resolve to
+  /// success if stdin was closed by the writer or to an error-code if reading
+  /// failed for some other reason.
+  ///
+  /// Multiple streams may be active at the same time. The behavior of concurrent
+  /// reads is implementation-specific.
+  @since(version = 0.3.0)
+  read-via-stream: func() -> tuple<stream<u8>, future<result<_, error-code>>>;
+}
+
+@since(version = 0.3.0)
+interface stdout {
+  use types.{error-code};
+
+  /// Write the given stream to stdout.
+  ///
+  /// If the stream's writable end is dropped this function will either return
+  /// success once the entire contents of the stream have been written or an
+  /// error-code representing a failure.
+  ///
+  /// Otherwise if there is an error the readable end of the stream will be
+  /// dropped and this function will return an error-code.
+  @since(version = 0.3.0)
+  write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+}
+
+@since(version = 0.3.0)
+interface stderr {
+  use types.{error-code};
+
+  /// Write the given stream to stderr.
+  ///
+  /// If the stream's writable end is dropped this function will either return
+  /// success once the entire contents of the stream have been written or an
+  /// error-code representing a failure.
+  ///
+  /// Otherwise if there is an error the readable end of the stream will be
+  /// dropped and this function will return an error-code.
+  @since(version = 0.3.0)
+  write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+}
+
+/// Terminal input.
+///
+/// In the future, this may include functions for disabling echoing,
+/// disabling input buffering so that keyboard events are sent through
+/// immediately, querying supported features, and so on.
+@since(version = 0.3.0)
+interface terminal-input {
+  /// The input side of a terminal.
+  @since(version = 0.3.0)
+  resource terminal-input;
+}
+
+/// Terminal output.
+///
+/// In the future, this may include functions for querying the terminal
+/// size, being notified of terminal size changes, querying supported
+/// features, and so on.
+@since(version = 0.3.0)
+interface terminal-output {
+  /// The output side of a terminal.
+  @since(version = 0.3.0)
+  resource terminal-output;
+}
+
+/// An interface providing an optional `terminal-input` for stdin as a
+/// link-time authority.
+@since(version = 0.3.0)
+interface terminal-stdin {
+  @since(version = 0.3.0)
+  use terminal-input.{terminal-input};
+
+  /// If stdin is connected to a terminal, return a `terminal-input` handle
+  /// allowing further interaction with it.
+  @since(version = 0.3.0)
+  get-terminal-stdin: func() -> option<terminal-input>;
+}
+
+/// An interface providing an optional `terminal-output` for stdout as a
+/// link-time authority.
+@since(version = 0.3.0)
+interface terminal-stdout {
+  @since(version = 0.3.0)
+  use terminal-output.{terminal-output};
+
+  /// If stdout is connected to a terminal, return a `terminal-output` handle
+  /// allowing further interaction with it.
+  @since(version = 0.3.0)
+  get-terminal-stdout: func() -> option<terminal-output>;
+}
+
+/// An interface providing an optional `terminal-output` for stderr as a
+/// link-time authority.
+@since(version = 0.3.0)
+interface terminal-stderr {
+  @since(version = 0.3.0)
+  use terminal-output.{terminal-output};
+
+  /// If stderr is connected to a terminal, return a `terminal-output` handle
+  /// allowing further interaction with it.
+  @since(version = 0.3.0)
+  get-terminal-stderr: func() -> option<terminal-output>;
+}
+
+@since(version = 0.3.0)
+world imports {
+  @since(version = 0.3.0)
+  import environment;
+  @since(version = 0.3.0)
+  import exit;
+  @since(version = 0.3.0)
+  import types;
+  @since(version = 0.3.0)
+  import stdin;
+  @since(version = 0.3.0)
+  import stdout;
+  @since(version = 0.3.0)
+  import stderr;
+  @since(version = 0.3.0)
+  import terminal-input;
+  @since(version = 0.3.0)
+  import terminal-output;
+  @since(version = 0.3.0)
+  import terminal-stdin;
+  @since(version = 0.3.0)
+  import terminal-stdout;
+  @since(version = 0.3.0)
+  import terminal-stderr;
+  import wasi:clocks/types@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  import wasi:clocks/system-clock@0.3.0;
+  @unstable(feature = clocks-timezone)
+  import wasi:clocks/timezone@0.3.0;
+  import wasi:filesystem/types@0.3.0;
+  import wasi:filesystem/preopens@0.3.0;
+  import wasi:sockets/types@0.3.0;
+  import wasi:sockets/ip-name-lookup@0.3.0;
+  import wasi:random/random@0.3.0;
+  import wasi:random/insecure@0.3.0;
+  import wasi:random/insecure-seed@0.3.0;
+}
+@since(version = 0.3.0)
+world command {
+  @since(version = 0.3.0)
+  import environment;
+  @since(version = 0.3.0)
+  import exit;
+  @since(version = 0.3.0)
+  import types;
+  @since(version = 0.3.0)
+  import stdin;
+  @since(version = 0.3.0)
+  import stdout;
+  @since(version = 0.3.0)
+  import stderr;
+  @since(version = 0.3.0)
+  import terminal-input;
+  @since(version = 0.3.0)
+  import terminal-output;
+  @since(version = 0.3.0)
+  import terminal-stdin;
+  @since(version = 0.3.0)
+  import terminal-stdout;
+  @since(version = 0.3.0)
+  import terminal-stderr;
+  import wasi:clocks/types@0.3.0;
+  import wasi:clocks/monotonic-clock@0.3.0;
+  import wasi:clocks/system-clock@0.3.0;
+  @unstable(feature = clocks-timezone)
+  import wasi:clocks/timezone@0.3.0;
+  import wasi:filesystem/types@0.3.0;
+  import wasi:filesystem/preopens@0.3.0;
+  import wasi:sockets/types@0.3.0;
+  import wasi:sockets/ip-name-lookup@0.3.0;
+  import wasi:random/random@0.3.0;
+  import wasi:random/insecure@0.3.0;
+  import wasi:random/insecure-seed@0.3.0;
+
+  @since(version = 0.3.0)
+  export run;
+}
+package wasi:clocks@0.3.0 {
+  interface types {
+    type duration = u64;
+  }
+  interface monotonic-clock {
+    use types.{duration};
+
+    type mark = u64;
+
+    now: func() -> mark;
+
+    get-resolution: func() -> duration;
+
+    wait-until: async func(when: mark);
+
+    wait-for: async func(how-long: duration);
+  }
+  interface system-clock {
+    use types.{duration};
+
+    record instant {
+      seconds: s64,
+      nanoseconds: u32,
+    }
+
+    now: func() -> instant;
+
+    get-resolution: func() -> duration;
+  }
+  interface timezone {
+    use system-clock.{instant};
+
+    iana-id: func() -> option<string>;
+
+    utc-offset: func(when: instant) -> option<s64>;
+
+    to-debug-string: func() -> string;
+  }
+}
+
+
+package wasi:filesystem@0.3.0 {
+  interface types {
+    use wasi:clocks/system-clock@0.3.0.{instant};
+
+    type filesize = u64;
+
+    variant descriptor-type {
+      block-device,
+      character-device,
+      directory,
+      fifo,
+      symbolic-link,
+      regular-file,
+      socket,
+      other(option<string>),
+    }
+
+    flags descriptor-flags {
+      read,
+      write,
+      file-integrity-sync,
+      data-integrity-sync,
+      requested-write-sync,
+      mutate-directory,
+    }
+
+    flags path-flags {
+      symlink-follow,
+    }
+
+    flags open-flags {
+      create,
+      directory,
+      exclusive,
+      truncate,
+    }
+
+    type link-count = u64;
+
+    record descriptor-stat {
+      %type: descriptor-type,
+      link-count: link-count,
+      size: filesize,
+      data-access-timestamp: option<instant>,
+      data-modification-timestamp: option<instant>,
+      status-change-timestamp: option<instant>,
+    }
+
+    variant new-timestamp {
+      no-change,
+      now,
+      timestamp(instant),
+    }
+
+    record directory-entry {
+      %type: descriptor-type,
+      name: string,
+    }
+
+    variant error-code {
+      access,
+      already,
+      bad-descriptor,
+      busy,
+      deadlock,
+      quota,
+      exist,
+      file-too-large,
+      illegal-byte-sequence,
+      in-progress,
+      interrupted,
+      invalid,
+      io,
+      is-directory,
+      loop,
+      too-many-links,
+      message-size,
+      name-too-long,
+      no-device,
+      no-entry,
+      no-lock,
+      insufficient-memory,
+      insufficient-space,
+      not-directory,
+      not-empty,
+      not-recoverable,
+      unsupported,
+      no-tty,
+      no-such-device,
+      overflow,
+      not-permitted,
+      pipe,
+      read-only,
+      invalid-seek,
+      text-file-busy,
+      cross-device,
+      other(option<string>),
+    }
+
+    enum advice {
+      normal,
+      sequential,
+      random,
+      will-need,
+      dont-need,
+      no-reuse,
+    }
+
+    record metadata-hash-value {
+      lower: u64,
+      upper: u64,
+    }
+
+    resource descriptor {
+      read-via-stream: func(offset: filesize) -> tuple<stream<u8>, future<result<_, error-code>>>;
+      write-via-stream: func(data: stream<u8>, offset: filesize) -> future<result<_, error-code>>;
+      append-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+      advise: async func(offset: filesize, length: filesize, advice: advice) -> result<_, error-code>;
+      sync-data: async func() -> result<_, error-code>;
+      get-flags: async func() -> result<descriptor-flags, error-code>;
+      get-type: async func() -> result<descriptor-type, error-code>;
+      set-size: async func(size: filesize) -> result<_, error-code>;
+      set-times: async func(data-access-timestamp: new-timestamp, data-modification-timestamp: new-timestamp) -> result<_, error-code>;
+      read-directory: func() -> tuple<stream<directory-entry>, future<result<_, error-code>>>;
+      sync: async func() -> result<_, error-code>;
+      create-directory-at: async func(path: string) -> result<_, error-code>;
+      stat: async func() -> result<descriptor-stat, error-code>;
+      stat-at: async func(path-flags: path-flags, path: string) -> result<descriptor-stat, error-code>;
+      set-times-at: async func(path-flags: path-flags, path: string, data-access-timestamp: new-timestamp, data-modification-timestamp: new-timestamp) -> result<_, error-code>;
+      link-at: async func(old-path-flags: path-flags, old-path: string, new-descriptor: borrow<descriptor>, new-path: string) -> result<_, error-code>;
+      open-at: async func(path-flags: path-flags, path: string, open-flags: open-flags, %flags: descriptor-flags) -> result<descriptor, error-code>;
+      readlink-at: async func(path: string) -> result<string, error-code>;
+      remove-directory-at: async func(path: string) -> result<_, error-code>;
+      rename-at: async func(old-path: string, new-descriptor: borrow<descriptor>, new-path: string) -> result<_, error-code>;
+      symlink-at: async func(old-path: string, new-path: string) -> result<_, error-code>;
+      unlink-file-at: async func(path: string) -> result<_, error-code>;
+      is-same-object: async func(other: borrow<descriptor>) -> bool;
+      metadata-hash: async func() -> result<metadata-hash-value, error-code>;
+      metadata-hash-at: async func(path-flags: path-flags, path: string) -> result<metadata-hash-value, error-code>;
+    }
+  }
+  interface preopens {
+    use types.{descriptor};
+
+    get-directories: func() -> list<tuple<descriptor, string>>;
+  }
+}
+
+
+package wasi:sockets@0.3.0 {
+  interface types {
+    use wasi:clocks/types@0.3.0.{duration};
+
+    variant error-code {
+      access-denied,
+      not-supported,
+      invalid-argument,
+      out-of-memory,
+      timeout,
+      invalid-state,
+      address-not-bindable,
+      address-in-use,
+      remote-unreachable,
+      connection-refused,
+      connection-broken,
+      connection-reset,
+      connection-aborted,
+      datagram-too-large,
+      other(option<string>),
+    }
+
+    enum ip-address-family {
+      ipv4,
+      ipv6,
+    }
+
+    type ipv4-address = tuple<u8, u8, u8, u8>;
+
+    type ipv6-address = tuple<u16, u16, u16, u16, u16, u16, u16, u16>;
+
+    variant ip-address {
+      ipv4(ipv4-address),
+      ipv6(ipv6-address),
+    }
+
+    record ipv4-socket-address {
+      port: u16,
+      address: ipv4-address,
+    }
+
+    record ipv6-socket-address {
+      port: u16,
+      flow-info: u32,
+      address: ipv6-address,
+      scope-id: u32,
+    }
+
+    variant ip-socket-address {
+      ipv4(ipv4-socket-address),
+      ipv6(ipv6-socket-address),
+    }
+
+    resource tcp-socket {
+      create: static func(address-family: ip-address-family) -> result<tcp-socket, error-code>;
+      bind: func(local-address: ip-socket-address) -> result<_, error-code>;
+      connect: async func(remote-address: ip-socket-address) -> result<_, error-code>;
+      listen: func() -> result<stream<tcp-socket>, error-code>;
+      send: func(data: stream<u8>) -> future<result<_, error-code>>;
+      receive: func() -> tuple<stream<u8>, future<result<_, error-code>>>;
+      get-local-address: func() -> result<ip-socket-address, error-code>;
+      get-remote-address: func() -> result<ip-socket-address, error-code>;
+      get-is-listening: func() -> bool;
+      get-address-family: func() -> ip-address-family;
+      set-listen-backlog-size: func(value: u64) -> result<_, error-code>;
+      get-keep-alive-enabled: func() -> result<bool, error-code>;
+      set-keep-alive-enabled: func(value: bool) -> result<_, error-code>;
+      get-keep-alive-idle-time: func() -> result<duration, error-code>;
+      set-keep-alive-idle-time: func(value: duration) -> result<_, error-code>;
+      get-keep-alive-interval: func() -> result<duration, error-code>;
+      set-keep-alive-interval: func(value: duration) -> result<_, error-code>;
+      get-keep-alive-count: func() -> result<u32, error-code>;
+      set-keep-alive-count: func(value: u32) -> result<_, error-code>;
+      get-hop-limit: func() -> result<u8, error-code>;
+      set-hop-limit: func(value: u8) -> result<_, error-code>;
+      get-receive-buffer-size: func() -> result<u64, error-code>;
+      set-receive-buffer-size: func(value: u64) -> result<_, error-code>;
+      get-send-buffer-size: func() -> result<u64, error-code>;
+      set-send-buffer-size: func(value: u64) -> result<_, error-code>;
+    }
+
+    resource udp-socket {
+      create: static func(address-family: ip-address-family) -> result<udp-socket, error-code>;
+      bind: func(local-address: ip-socket-address) -> result<_, error-code>;
+      connect: func(remote-address: ip-socket-address) -> result<_, error-code>;
+      disconnect: func() -> result<_, error-code>;
+      send: async func(data: list<u8>, remote-address: option<ip-socket-address>) -> result<_, error-code>;
+      receive: async func() -> result<tuple<list<u8>, ip-socket-address>, error-code>;
+      get-local-address: func() -> result<ip-socket-address, error-code>;
+      get-remote-address: func() -> result<ip-socket-address, error-code>;
+      get-address-family: func() -> ip-address-family;
+      get-unicast-hop-limit: func() -> result<u8, error-code>;
+      set-unicast-hop-limit: func(value: u8) -> result<_, error-code>;
+      get-receive-buffer-size: func() -> result<u64, error-code>;
+      set-receive-buffer-size: func(value: u64) -> result<_, error-code>;
+      get-send-buffer-size: func() -> result<u64, error-code>;
+      set-send-buffer-size: func(value: u64) -> result<_, error-code>;
+    }
+  }
+  interface ip-name-lookup {
+    use types.{ip-address};
+
+    variant error-code {
+      access-denied,
+      invalid-argument,
+      name-unresolvable,
+      temporary-resolver-failure,
+      permanent-resolver-failure,
+      other(option<string>),
+    }
+
+    resolve-addresses: async func(name: string) -> result<list<ip-address>, error-code>;
+  }
+}
+
+
+package wasi:random@0.3.0 {
+  interface random {
+    get-random-bytes: func(max-len: u64) -> list<u8>;
+
+    get-random-u64: func() -> u64;
+  }
+  interface insecure {
+    get-insecure-random-bytes: func(max-len: u64) -> list<u8>;
+
+    get-insecure-random-u64: func() -> u64;
+  }
+  interface insecure-seed {
+    get-insecure-seed: func() -> tuple<u64, u64>;
+  }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "stream-demo-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtime = { version = "45", features = ["component-model", "component-model-async", "async"] }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[[bin]]
+name = "host"
+path = "src/main.rs"

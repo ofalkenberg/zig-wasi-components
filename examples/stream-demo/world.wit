@@ -1,0 +1,19 @@
+package demo:streams@0.3.0;
+
+interface numbers {
+    /// Stream the first `count` perfect squares (1, 4, 9, 16, ...) to the
+    /// host as a `stream<u32>`. Exercises a typed, four-byte-element stream
+    /// end to end: the guest mints the stream, writes every element with one
+    /// async `stream.write`, hands the readable end back through `task.return`,
+    /// and only drops the writable end once the host has drained it.
+    squares: async func(count: u32) -> stream<u32>;
+
+    /// Stream the first `count` Fibonacci numbers as a `stream<u64>`. Same
+    /// machinery as `squares`, but with a wider eight-byte element type to
+    /// show that the generic `stream<T>` path is not special-cased to bytes.
+    fibonacci: async func(count: u32) -> stream<u64>;
+}
+
+world demo {
+    export numbers;
+}
