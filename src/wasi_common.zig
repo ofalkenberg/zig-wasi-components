@@ -148,6 +148,24 @@ pub fn parseUrl(url: []const u8) ?ParsedUrl {
     return .{ .https = https, .host = host, .path = path };
 }
 
+/// Copy a slice of lifted tuples into `gpa`-owned memory, deep-copying
+/// every `[]const u8` field. Lifted import results live in the
+/// cabi_realloc arena, which is reset when the last live export task
+/// exits — anything cached across export calls must own stable copies.
+pub fn dupeTuplesStable(gpa: std.mem.Allocator, fresh: anytype) @TypeOf(fresh) {
+    const T = @typeInfo(@TypeOf(fresh)).pointer.child;
+    const info = @typeInfo(T).@"struct";
+    const stable = gpa.alloc(T, fresh.len) catch @panic("oom");
+    for (fresh, stable) |src, *dst| {
+        dst.* = src;
+        inline for (info.field_names, info.field_types) |name, FT| {
+            if (comptime FT == []const u8)
+                @field(dst, name) = gpa.dupe(u8, @field(src, name)) catch @panic("oom");
+        }
+    }
+    return stable;
+}
+
 /// `wasi:random` kept the same shape across 0.2 and 0.3, so one
 /// generic serves both convenience modules.
 pub fn Random(comptime b: type) type {
@@ -282,4 +300,20 @@ test "resolvePreopen picks longest prefix and normalises" {
         try std.testing.expectEqualStrings("relative/file", rel);
     }
     try std.testing.expectError(error.NotPreopened, resolvePreopen(dirs[0..2], "/etc/passwd"));
+}
+
+test "dupeTuplesStable deep-copies string fields" {
+    const gpa = std.testing.allocator;
+    const Pair = struct { u32, []const u8 };
+    var name_buf = "hello".*;
+    const fresh = [_]Pair{ .{ 7, &name_buf }, .{ 9, "static" } };
+    const stable = dupeTuplesStable(gpa, @as([]const Pair, &fresh));
+    defer {
+        for (stable) |p| gpa.free(p[1]);
+        gpa.free(stable);
+    }
+    name_buf = "XXXXX".*;
+    try std.testing.expectEqual(@as(u32, 7), stable[0][0]);
+    try std.testing.expectEqualStrings("hello", stable[0][1]);
+    try std.testing.expectEqualStrings("static", stable[1][1]);
 }

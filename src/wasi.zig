@@ -458,8 +458,8 @@ pub fn Wasi(comptime b: type) type {
             fn cachedPreopens() []const struct { fst.types.descriptor, []const u8 } {
                 if (preopens_cache) |c| return c;
                 const fresh = fsp.get_directories();
-                preopens_cache = fresh;
-                return fresh;
+                preopens_cache = common.dupeTuplesStable(std.heap.wasm_allocator, fresh);
+                return preopens_cache.?;
             }
 
             const mapError = common.mapFsError;

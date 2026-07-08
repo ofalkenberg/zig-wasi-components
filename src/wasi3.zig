@@ -181,8 +181,8 @@ pub fn Wasi3(comptime b: type) type {
             pub fn vars() []const struct { []const u8, []const u8 } {
                 if (vars_cache) |c| return c;
                 const fresh = b.wasi_cli_environment.get_environment();
-                vars_cache = fresh;
-                return fresh;
+                vars_cache = common.dupeTuplesStable(std.heap.wasm_allocator, fresh);
+                return vars_cache.?;
             }
 
             /// First value for `name`, or null if unset. Returned by
@@ -261,8 +261,8 @@ pub fn Wasi3(comptime b: type) type {
             fn cachedPreopens() []const struct { fst.types.descriptor, []const u8 } {
                 if (preopens_cache) |c| return c;
                 const fresh = fsp.get_directories();
-                preopens_cache = fresh;
-                return fresh;
+                preopens_cache = common.dupeTuplesStable(std.heap.wasm_allocator, fresh);
+                return preopens_cache.?;
             }
 
             const mapError = common.mapFsError;
@@ -539,13 +539,28 @@ pub fn Wasi3(comptime b: type) type {
                 recv_readable: abi.Stream,
                 recv_future: abi.Future,
                 closed: bool = false,
+                // Once a copy on a stream end resolves DROPPED the end
+                // is in the DONE state and re-entering read/write traps,
+                // so each direction remembers that it is finished.
+                send_done: bool = false,
+                recv_done: bool = false,
 
-                pub fn write(self: TcpStream, data: []const u8) StreamError!void {
-                    return abi.streamWriteAll(tcp.intrinsics_send.stream0, self.send_writable, data);
+                pub fn write(self: *TcpStream, data: []const u8) StreamError!void {
+                    if (self.send_done) return error.StreamClosed;
+                    return abi.streamWriteAll(tcp.intrinsics_send.stream0, self.send_writable, data) catch |e| {
+                        if (e == error.StreamClosed) self.send_done = true;
+                        return e;
+                    };
                 }
 
-                pub fn readAll(self: TcpStream, gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
-                    return abi.streamDrainBytes(tcp.intrinsics_receive.stream0, gpa, self.recv_readable, max_bytes);
+                /// Read until the peer closes or `max_bytes` arrive.
+                /// After the peer closes, further calls return an empty
+                /// slice (EOF), matching the 0.2 layer's behaviour.
+                pub fn readAll(self: *TcpStream, gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
+                    if (self.recv_done) return gpa.alloc(u8, 0);
+                    const r = try abi.streamDrainBytesEof(tcp.intrinsics_receive.stream0, gpa, self.recv_readable, max_bytes);
+                    if (r.eof) self.recv_done = true;
+                    return r.data;
                 }
 
                 /// Drop the connection's streams, futures and socket.
@@ -673,21 +688,25 @@ pub fn Wasi3(comptime b: type) type {
 
                 // request.new wants a trailers future. The host only
                 // reads it while `send` is in flight, so park an async
-                // write of `ok(none)` in a buffer that outlives the
-                // blocking call, and reap it afterwards.
+                // write of `ok(none)` that outlives the blocking call
+                // and reap its completion once `send` returns. On error
+                // paths the host may never touch the future, so dispose
+                // without blocking instead.
                 const rn = req_res.intrinsics_new;
                 const trailers = rn.future1.new();
-                var trailers_buf: [rn.future1.elem_size]u8 align(rn.future1.elem_align) = undefined;
-                rn.future1.lower(.{ .ok = null }, @intFromPtr(&trailers_buf));
-                _ = rn.future1.writeRawAsync(trailers.writable, @intFromPtr(&trailers_buf));
-                defer {
-                    _ = rn.future1.cancelWrite(trailers.writable);
-                    rn.future1.dropWritable(trailers.writable);
-                }
+                var trailers_delivery: abi.FutureDelivery(rn.future1) = undefined;
+                trailers_delivery.start(trailers.writable, .{ .ok = null });
+                errdefer trailers_delivery.abandon();
 
                 const made = req_res.new(headers, null, trailers.readable, null);
                 const outgoing = made[0];
                 defer rn.future2.dropReadable(made[1]);
+
+                // `send` consumes the request; until then we own it, and
+                // dropping it on failure is also what resolves the
+                // parked trailers write (the readable end dies with it).
+                var request_owned = true;
+                errdefer if (request_owned) req_res.drop(outgoing);
 
                 try check(req_res.set_method(outgoing, req.method.lower()), error.SetMethodFailed);
                 try check(req_res.set_authority(outgoing, target.host), error.SetAuthorityFailed);
@@ -695,10 +714,15 @@ pub fn Wasi3(comptime b: type) type {
                 const scheme: wht.types.scheme = if (target.https) .{ .HTTPS = {} } else .{ .HTTP = {} };
                 try check(req_res.set_scheme(outgoing, scheme), error.SetSchemeFailed);
 
+                request_owned = false;
                 const response = switch (client.send(outgoing)) {
                     .ok => |r| r,
                     .err => return error.HttpErrored,
                 };
+                trailers_delivery.finish();
+
+                var response_owned = true;
+                errdefer if (response_owned) resp_res.drop(response);
 
                 const status = resp_res.get_status_code(response);
 
@@ -723,15 +747,17 @@ pub fn Wasi3(comptime b: type) type {
                 }
 
                 // consume-body moves the response, so it must not be
-                // dropped afterwards. The `res` future lets us report a
-                // processing error to the host; we never need to, so
-                // its writable end is reaped unwritten.
+                // dropped afterwards. The `res` future reports our
+                // processing outcome to the host; a writable future end
+                // must deliver a value before it can be dropped, so park
+                // an `ok` write now and reap it once the body is drained
+                // (or dispose without blocking on error paths).
                 const cb = resp_res.intrinsics_consume_body;
                 const res_pair = cb.future0.new();
-                defer {
-                    _ = cb.future0.cancelWrite(res_pair.writable);
-                    cb.future0.dropWritable(res_pair.writable);
-                }
+                var res_delivery: abi.FutureDelivery(cb.future0) = undefined;
+                res_delivery.start(res_pair.writable, .{ .ok = {} });
+                errdefer res_delivery.abandon();
+                response_owned = false;
                 const body_pair = resp_res.consume_body(response, res_pair.readable);
                 defer cb.future2.dropReadable(body_pair[1]);
 
@@ -746,6 +772,7 @@ pub fn Wasi3(comptime b: type) type {
                         .err => return error.HttpErrored,
                     }
                 }
+                res_delivery.finish();
 
                 return .{
                     .status = status,

@@ -367,18 +367,9 @@ pub fn flattenType(out: *std.ArrayList(CoreType), gpa: Allocator, r: *Resolver, 
                 .record => |fields| for (fields) |f| try flattenType(out, gpa, r, f.ty),
                 .variant => |cases| {
                     try out.append(gpa, .i32);
-                    var biggest: []CoreType = &.{};
-                    defer if (biggest.len != 0) gpa.free(biggest);
-                    for (cases) |c| {
-                        if (c.ty == null) continue;
-                        var flat: std.ArrayList(CoreType) = .empty;
-                        defer flat.deinit(gpa);
-                        try flattenType(&flat, gpa, r, c.ty.?);
-                        const merged = try joinFlats(gpa, biggest, flat.items);
-                        if (biggest.len != 0) gpa.free(biggest);
-                        biggest = merged;
-                    }
-                    try out.appendSlice(gpa, biggest);
+                    const joined = try variantJoinedPayload(gpa, r, cases);
+                    defer gpa.free(joined);
+                    try out.appendSlice(gpa, joined);
                 },
                 .@"enum" => try out.append(gpa, .i32),
                 .flags => |labels| {
@@ -408,7 +399,102 @@ fn joinOne(a: ?CoreType, b: ?CoreType) CoreType {
     if (a == null) return b.?;
     if (b == null) return a.?;
     if (a.? == b.?) return a.?;
+    if ((a.? == .i32 and b.? == .f32) or (a.? == .f32 and b.? == .i32)) return .i32;
     return .i64;
+}
+
+/// Joined flat types of a variant's payload (everything after the
+/// i32 discriminant), folded across all cases per the spec's
+/// flatten_variant. Caller owns the returned slice.
+fn variantJoinedPayload(gpa: Allocator, r: *Resolver, cases: []const wit.Case) Error![]CoreType {
+    var joined = try gpa.alloc(CoreType, 0);
+    errdefer gpa.free(joined);
+    for (cases) |c| {
+        if (c.ty == null) continue;
+        var flat: std.ArrayList(CoreType) = .empty;
+        defer flat.deinit(gpa);
+        try flattenType(&flat, gpa, r, c.ty.?);
+        const merged = try joinFlats(gpa, joined, flat.items);
+        gpa.free(joined);
+        joined = merged;
+    }
+    return joined;
+}
+
+/// Reinterpret wrapper applied when lowering a case payload's own
+/// flat value (`have`) into the variant's joined slot type (`want`),
+/// per the spec's lower_flat_variant. i32 payloads widen into i64
+/// slots zero-extended (core flat values carry the unsigned
+/// representation; the lifting side wraps back to the low 32 bits).
+fn lowerCoerce(have: CoreType, want: CoreType) struct { pre: []const u8, post: []const u8 } {
+    if (have == want) return .{ .pre = "", .post = "" };
+    return switch (have) {
+        .f32 => switch (want) {
+            .i32 => .{ .pre = "@as(i32, @bitCast(", .post = "))" },
+            .i64 => .{ .pre = "@as(i64, @as(u32, @bitCast(", .post = ")))" },
+            else => unreachable,
+        },
+        .f64 => .{ .pre = "@as(i64, @bitCast(", .post = "))" },
+        .i32 => .{ .pre = "@as(i64, @as(u32, @bitCast(", .post = ")))" },
+        else => unreachable,
+    };
+}
+
+/// Emit `p<idx>` coerced from its declared (joined) core type
+/// `slots[idx]` to the flat type a case payload's lift expects,
+/// mirroring the spec's lift_flat_variant CoerceValueIter.
+fn emitSlotAs(w: *std.Io.Writer, slots: []const CoreType, idx: usize, want: CoreType) Error!void {
+    const have: CoreType = if (idx < slots.len) slots[idx] else want;
+    if (have == want) {
+        try w.print("p{d}", .{idx});
+        return;
+    }
+    switch (have) {
+        .i64 => switch (want) {
+            .i32 => try w.print("@as(i32, @truncate(p{d}))", .{idx}),
+            .f32 => try w.print("@as(f32, @bitCast(@as(i32, @truncate(p{d}))))", .{idx}),
+            .f64 => try w.print("@as(f64, @bitCast(p{d}))", .{idx}),
+            else => return Error.Unsupported,
+        },
+        .i32 => switch (want) {
+            .f32 => try w.print("@as(f32, @bitCast(p{d}))", .{idx}),
+            else => return Error.Unsupported,
+        },
+        else => return Error.Unsupported,
+    }
+}
+
+fn slotAsAlloc(gpa: Allocator, slots: []const CoreType, idx: usize, want: CoreType) Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    try emitSlotAs(&aw.writer, slots, idx, want);
+    return aw.toOwnedSlice();
+}
+
+/// True when the element's generated Zig in-memory layout is
+/// bit-identical to its canonical-ABI element layout on wasm32, so a
+/// canonical list buffer can be reinterpreted as `[]const T` in
+/// place. Aggregates (records, tuples, variants, options, results)
+/// use Zig's unspecified automatic layout and must go element-wise;
+/// char is excluded so lifting funnels through `abi.liftChar`.
+fn isPunnableListElem(r: *Resolver, ty: wit.TypeRef) bool {
+    return switch (ty.kind) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64 => true,
+        .char => false,
+        .string => true,
+        .own, .borrow, .stream, .future, .error_context => true,
+        .list => |inner| isPunnableListElem(r, inner.*),
+        .list_fixed => |info| isPunnableListElem(r, info.elem.*),
+        .named => |nm| {
+            const td = r.find(nm) orelse return false;
+            return switch (td.body) {
+                .@"enum", .flags, .resource => true,
+                .alias => |a| isPunnableListElem(r, a),
+                .record, .variant => false,
+            };
+        },
+        .option, .result, .tuple => false,
+    };
 }
 
 /// Backing-integer width of a `flags<N>` type, capped at the
@@ -566,8 +652,15 @@ fn emitLowerImportSlots(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: 
             try w.print("        const _p{d} = {s};\n", .{ slot.*, expr });
             slot.* += 1;
         },
-        .string, .list => {
+        .string => {
             try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast(@intFromPtr({s}.ptr))));\n", .{ slot.*, expr });
+            try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast({s}.len)));\n", .{ slot.* + 1, expr });
+            slot.* += 2;
+        },
+        .list => |inner| {
+            try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast(", .{slot.*});
+            try emitLowerListExpr(w, r, inner.*, expr);
+            try w.writeAll(")));\n");
             try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast({s}.len)));\n", .{ slot.* + 1, expr });
             slot.* += 2;
         },
@@ -678,8 +771,10 @@ fn emitLowerResultSlots(w: *std.Io.Writer, r: *Resolver, info: anytype, expr: []
             if (idx < ok_flat.items.len) {
                 var nb: [16]u8 = undefined;
                 const cap = allocCapture(r, &nb);
-                try w.print(".ok => |{s}| ", .{cap});
+                const co = lowerCoerce(ok_flat.items[idx], t);
+                try w.print(".ok => |{s}| {s}", .{ cap, co.pre });
                 try emitFlatSlotExpr(w, r, p.*, cap, idx);
+                try w.writeAll(co.post);
             } else {
                 try w.print(".ok => @as({s}, 0)", .{t.zigName()});
             }
@@ -691,8 +786,10 @@ fn emitLowerResultSlots(w: *std.Io.Writer, r: *Resolver, info: anytype, expr: []
             if (idx < err_flat.items.len) {
                 var nb: [16]u8 = undefined;
                 const cap = allocCapture(r, &nb);
-                try w.print(".err => |{s}| ", .{cap});
+                const co = lowerCoerce(err_flat.items[idx], t);
+                try w.print(".err => |{s}| {s}", .{ cap, co.pre });
                 try emitFlatSlotExpr(w, r, p.*, cap, idx);
+                try w.writeAll(co.post);
             } else {
                 try w.print(".err => @as({s}, 0)", .{t.zigName()});
             }
@@ -715,6 +812,8 @@ fn emitVariantSlotExpr(w: *std.Io.Writer, r: *Resolver, cases: []const wit.Case,
         try w.writeAll(" })");
         return;
     }
+    const joined = try variantJoinedPayload(r.gpa, r, cases);
+    defer r.gpa.free(joined);
     try w.print("switch ({s}) {{", .{expr});
     for (cases) |c| {
         try w.writeAll(" .");
@@ -727,9 +826,10 @@ fn emitVariantSlotExpr(w: *std.Io.Writer, r: *Resolver, cases: []const wit.Case,
             if (payload_slot < case_flat.items.len) {
                 var nb: [16]u8 = undefined;
                 const cap = allocCapture(r, &nb);
-                try w.print(" => |{s}| ", .{cap});
+                const co = lowerCoerce(case_flat.items[payload_slot], joined[payload_slot]);
+                try w.print(" => |{s}| {s}", .{ cap, co.pre });
                 try emitFlatSlotExpr(w, r, pty, cap, payload_slot);
-                try w.writeAll(",");
+                try w.print("{s},", .{co.post});
                 continue;
             }
         }
@@ -764,9 +864,20 @@ fn emitFlatSlotExpr(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []co
             if (slot_idx != 0) return Error.Unsupported;
             try w.writeAll(expr);
         },
-        .string, .list => {
+        .string => {
             switch (slot_idx) {
                 0 => try w.print("@as(i32, @bitCast(@as(u32, @intCast(@intFromPtr({s}.ptr)))))", .{expr}),
+                1 => try w.print("@as(i32, @bitCast(@as(u32, @intCast({s}.len))))", .{expr}),
+                else => return Error.Unsupported,
+            }
+        },
+        .list => |inner| {
+            switch (slot_idx) {
+                0 => {
+                    try w.writeAll("@as(i32, @bitCast(@as(u32, @intCast(");
+                    try emitLowerListExpr(w, r, inner.*, expr);
+                    try w.writeAll("))))");
+                },
                 1 => try w.print("@as(i32, @bitCast(@as(u32, @intCast({s}.len))))", .{expr}),
                 else => return Error.Unsupported,
             }
@@ -876,15 +987,18 @@ fn emitResultSlotExpr(w: *std.Io.Writer, r: *Resolver, info: anytype, expr: []co
     defer err_flat.deinit(r.gpa);
     if (info.err) |p| try flattenType(&err_flat, r.gpa, r, p.*);
     const payload_slot = slot_idx - 1;
+    const joined = try joinFlats(r.gpa, ok_flat.items, err_flat.items);
+    defer r.gpa.free(joined);
 
     try w.print("switch ({s}) {{", .{expr});
     if (info.ok) |p| {
         if (payload_slot < ok_flat.items.len) {
             var nb: [16]u8 = undefined;
             const cap = allocCapture(r, &nb);
-            try w.print(" .ok => |{s}| ", .{cap});
+            const co = lowerCoerce(ok_flat.items[payload_slot], joined[payload_slot]);
+            try w.print(" .ok => |{s}| {s}", .{ cap, co.pre });
             try emitFlatSlotExpr(w, r, p.*, cap, payload_slot);
-            try w.writeAll(",");
+            try w.print("{s},", .{co.post});
         } else {
             try w.writeAll(" .ok => 0,");
         }
@@ -895,9 +1009,10 @@ fn emitResultSlotExpr(w: *std.Io.Writer, r: *Resolver, info: anytype, expr: []co
         if (payload_slot < err_flat.items.len) {
             var nb: [16]u8 = undefined;
             const cap = allocCapture(r, &nb);
-            try w.print(" .err => |{s}| ", .{cap});
+            const co = lowerCoerce(err_flat.items[payload_slot], joined[payload_slot]);
+            try w.print(" .err => |{s}| {s}", .{ cap, co.pre });
             try emitFlatSlotExpr(w, r, p.*, cap, payload_slot);
-            try w.writeAll(",");
+            try w.print("{s},", .{co.post});
         } else {
             try w.writeAll(" .err => 0,");
         }
@@ -917,17 +1032,6 @@ fn emitFuncAliases(w: *std.Io.Writer, r: *Resolver, fn_prefix: []const u8, f: wi
             try emitTypeRef(w, r, ty);
             try w.writeAll(";\n");
         }
-    } else if (f.results.len > 1) {
-        try w.writeAll("pub const ");
-        try zigIdent(w, fn_prefix);
-        try w.writeAll("_result = struct { ");
-        for (f.results, 0..) |res, i| {
-            if (i != 0) try w.writeAll(", ");
-            try zigIdent(w, res.name);
-            try w.writeAll(": ");
-            try emitTypeRef(w, r, res.ty);
-        }
-        try w.writeAll(" };\n");
     }
     for (f.params) |p| {
         if (!needsAlias(p.ty.kind)) continue;
@@ -1136,6 +1240,60 @@ fn emitNamedTypeRef(w: *std.Io.Writer, r: *Resolver, name: []const u8) Error!voi
 // Lifting / lowering across the canonical-ABI memory layout.
 // =====================================================================
 
+/// Emit an expression that lifts a list from linear memory into a
+/// `[]const T`. Punnable elements reinterpret the canonical buffer in
+/// place; everything else copies element-by-element into a fresh
+/// array from the realloc arena, lifting each element through its
+/// canonical layout. `ptr_expr` / `len_expr` must be usize-typed.
+fn emitLiftListExpr(w: *std.Io.Writer, r: *Resolver, elem: wit.TypeRef, ptr_expr: []const u8, len_expr: []const u8) Error!void {
+    if (isPunnableListElem(r, elem)) {
+        try w.writeAll("@as([*]const ");
+        try emitTypeRef(w, r, elem);
+        try w.print(", @ptrFromInt({s}))[0..{s}]", .{ ptr_expr, len_expr });
+        return;
+    }
+    const n = r.label_counter;
+    r.label_counter += 1;
+    const el = try layoutOf(r, elem);
+    try w.print("blk_le_{d}: {{ const _lp_{d}: usize = {s}; const _ln_{d}: usize = {s}; var _lo_{d}: []const ", .{ n, n, ptr_expr, n, len_expr, n });
+    try emitTypeRef(w, r, elem);
+    try w.print(" = &.{{}}; if (_ln_{d} != 0) {{ const _lb_{d}: [*]", .{ n, n });
+    try emitTypeRef(w, r, elem);
+    try w.writeAll(" = @ptrCast(@alignCast(cabi_realloc(null, 0, @alignOf(");
+    try emitTypeRef(w, r, elem);
+    try w.print("), _ln_{d} * @sizeOf(", .{n});
+    try emitTypeRef(w, r, elem);
+    try w.print(")).?)); for (0.._ln_{d}) |_li_{d}| _lb_{d}[_li_{d}] = ", .{ n, n, n, n });
+    const base = try std.fmt.allocPrint(r.gpa, "(_lp_{d} + _li_{d} * {d})", .{ n, n, el.size });
+    defer r.gpa.free(base);
+    try emitLoadMem(w, r, elem, base, 0);
+    try w.print("; _lo_{d} = _lb_{d}[0.._ln_{d}]; }} break :blk_le_{d} _lo_{d}; }}", .{ n, n, n, n, n });
+}
+
+/// Emit an expression yielding the canonical buffer address of `expr`
+/// (a Zig slice) as a usize. Punnable elements pass the slice's own
+/// storage; everything else lowers element-by-element into a buffer
+/// from the realloc arena, which lives until the surrounding task's
+/// exit — the lifetime the host needs to lift it. For an empty slice
+/// no allocation is made and an aligned dangling address is produced
+/// (the spec only checks alignment and bounds for zero-length views).
+fn emitLowerListExpr(w: *std.Io.Writer, r: *Resolver, elem: wit.TypeRef, expr: []const u8) Error!void {
+    if (isPunnableListElem(r, elem)) {
+        try w.print("@intFromPtr({s}.ptr)", .{expr});
+        return;
+    }
+    const n = r.label_counter;
+    r.label_counter += 1;
+    const el = try layoutOf(r, elem);
+    try w.print("blk_ls_{d}: {{ const _sb_{d}: usize = if ({s}.len == 0) {d} else @intFromPtr(cabi_realloc(null, 0, {d}, {s}.len * {d}).?); for ({s}, 0..) |_se_{d}, _si_{d}| {{\n", .{ n, n, expr, el.@"align", el.@"align", expr, el.size, expr, n, n });
+    const base = try std.fmt.allocPrint(r.gpa, "(_sb_{d} + _si_{d} * {d})", .{ n, n, el.size });
+    defer r.gpa.free(base);
+    const elem_expr = try std.fmt.allocPrint(r.gpa, "_se_{d}", .{n});
+    defer r.gpa.free(elem_expr);
+    try emitStoreMem(w, r, elem, elem_expr, base, 0);
+    try w.print("    }} break :blk_ls_{d} _sb_{d}; }}", .{ n, n });
+}
+
 /// Emit a Zig expression that loads a value of WIT type `ty` from
 /// linear memory at `base_ptr_expr + offset`.
 fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u8, offset: u32) Error!void {
@@ -1151,22 +1309,16 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
         .u64 => try w.print("@as(*align(8) const u64, @ptrFromInt({s} + {d})).*", .{ base, offset }),
         .f32 => try w.print("@as(*align(4) const f32, @ptrFromInt({s} + {d})).*", .{ base, offset }),
         .f64 => try w.print("@as(*align(8) const f64, @ptrFromInt({s} + {d})).*", .{ base, offset }),
-        .char => try w.print("@as(u21, @intCast(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
-        .string, .list => {
-            // (ptr: u32, len: u32) at offset; element type is u8 for
-            // strings or the inner type for lists.
-            const elem_zig: []const u8 = blk: {
-                if (ty.kind == .string) break :blk "u8";
-                break :blk "u8"; // placeholder; we override below
-            };
-            _ = elem_zig;
-            try w.writeAll("@as([*]const ");
-            if (ty.kind == .string) {
-                try w.writeAll("u8");
-            } else {
-                try emitTypeRef(w, r, ty.kind.list.*);
-            }
-            try w.print(", @ptrFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))[0..@as(*align(4) const u32, @ptrFromInt({s} + {d})).*]", .{ base, offset, base, offset + 4 });
+        .char => try w.print("abi.liftChar(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*)", .{ base, offset }),
+        .string => {
+            try w.print("@as([*]const u8, @ptrFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))[0..@as(*align(4) const u32, @ptrFromInt({s} + {d})).*]", .{ base, offset, base, offset + 4 });
+        },
+        .list => |inner| {
+            const ptr_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset });
+            defer r.gpa.free(ptr_expr);
+            const len_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset + 4 });
+            defer r.gpa.free(len_expr);
+            try emitLiftListExpr(w, r, inner.*, ptr_expr, len_expr);
         },
         .own, .borrow => try w.print("@enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*)", .{ base, offset }),
         .error_context => try w.print("@as(abi.ErrorContext, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
@@ -1199,9 +1351,11 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
                         if (cl.@"align" > payload_align) payload_align = cl.@"align";
                     }
                     const p_off = payloadOffset(disc_s, payload_align);
-                    try w.print("blk_lv_{d}: {{ const _dlv_{d} = ", .{ offset, offset });
+                    const n = r.label_counter;
+                    r.label_counter += 1;
+                    try w.print("blk_lv_{d}: {{ const _dlv_{d} = ", .{ n, n });
                     try emitLoadDisc(w, base, offset, disc_s);
-                    try w.print("; break :blk_lv_{d} switch (_dlv_{d}) {{", .{ offset, offset });
+                    try w.print("; break :blk_lv_{d} switch (_dlv_{d}) {{", .{ n, n });
                     for (cases, 0..) |c, i| {
                         try w.print(" {d} => .{{ .", .{i});
                         try zigIdent(w, c.name);
@@ -1211,14 +1365,14 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
                         } else try w.writeAll(" = {}");
                         try w.writeAll(" },");
                     }
-                    try w.writeAll(" else => unreachable }; }");
+                    try w.writeAll(" else => abi.trap() }; }");
                 },
                 .@"enum" => |cases| {
-                    try w.print("@as(", .{});
+                    try w.writeAll("abi.liftEnum(");
                     try emitNamedTypeRef(w, r, nm);
-                    try w.writeAll(", @enumFromInt(");
+                    try w.writeAll(", ");
                     try emitLoadDisc(w, base, offset, discSize(cases.len));
-                    try w.writeAll("))");
+                    try w.writeAll(")");
                 },
                 .flags => |labels| {
                     const sz = (try layoutOf(r, ty)).size;
@@ -1232,11 +1386,13 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
         .option => |inner| {
             const inner_layout = try layoutOf(r, inner.*);
             const p_off = payloadOffset(1, inner_layout.@"align");
-            try w.print("blk_lo_{d}: {{ const _dlo_{d} = ", .{ offset, offset });
+            const n = r.label_counter;
+            r.label_counter += 1;
+            try w.print("blk_lo_{d}: {{ const _dlo_{d} = ", .{ n, n });
             try emitLoadDisc(w, base, offset, 1);
-            try w.print("; break :blk_lo_{d} if (_dlo_{d} == 0) null else ", .{ offset, offset });
+            try w.print("; break :blk_lo_{d} switch (_dlo_{d}) {{ 0 => null, 1 => ", .{ n, n });
             try emitLoadMem(w, r, inner.*, base, offset + p_off);
-            try w.writeAll("; }");
+            try w.writeAll(", else => abi.trap() }; }");
         },
         .result => |info| {
             var payload_align: u32 = 1;
@@ -1249,13 +1405,15 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
                 if (l.@"align" > payload_align) payload_align = l.@"align";
             }
             const p_off = payloadOffset(1, payload_align);
-            try w.print("blk_lr_{d}: {{ const _dlr_{d} = ", .{ offset, offset });
+            const n = r.label_counter;
+            r.label_counter += 1;
+            try w.print("blk_lr_{d}: {{ const _dlr_{d} = ", .{ n, n });
             try emitLoadDisc(w, base, offset, 1);
-            try w.print("; break :blk_lr_{d} switch (_dlr_{d}) {{ 0 => .{{ .ok = ", .{ offset, offset });
+            try w.print("; break :blk_lr_{d} switch (_dlr_{d}) {{ 0 => .{{ .ok = ", .{ n, n });
             if (info.ok) |p| try emitLoadMem(w, r, p.*, base, offset + p_off) else try w.writeAll("{}");
             try w.writeAll(" }, 1 => .{ .err = ");
             if (info.err) |p| try emitLoadMem(w, r, p.*, base, offset + p_off) else try w.writeAll("{}");
-            try w.writeAll(" }, else => unreachable }; }");
+            try w.writeAll(" }, else => abi.trap() }; }");
         },
         .tuple => |elems| {
             try w.writeAll(".{");
@@ -1311,8 +1469,14 @@ fn emitStoreMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []const 
         .f32 => try w.print("    @as(*align(4) f32, @ptrFromInt({s} + {d})).* = {s};\n", .{ base, offset, expr }),
         .f64 => try w.print("    @as(*align(8) f64, @ptrFromInt({s} + {d})).* = {s};\n", .{ base, offset, expr }),
         .char => try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = {s};\n", .{ base, offset, expr }),
-        .string, .list => {
+        .string => {
             try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast(@intFromPtr({s}.ptr));\n", .{ base, offset, expr });
+            try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast({s}.len);\n", .{ base, offset + 4, expr });
+        },
+        .list => |inner| {
+            try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast(", .{ base, offset });
+            try emitLowerListExpr(w, r, inner.*, expr);
+            try w.writeAll(");\n");
             try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast({s}.len);\n", .{ base, offset + 4, expr });
         },
         .own, .borrow, .error_context, .stream, .future => try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intFromEnum({s});\n", .{ base, offset, expr }),
@@ -1463,103 +1627,134 @@ fn emitStoreDiscExpr(w: *std.Io.Writer, base: []const u8, offset: u32, size: u32
 
 /// Emit a Zig expression that lifts a value of WIT type `ty` from the
 /// flat parameter slots starting at `*slot`. Advances `*slot` past
-/// the slots used. Slot identifiers are `p0`, `p1`, ...
-fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slot: *usize) Error!void {
+/// the slots used. Slot identifiers are `p0`, `p1`, ... whose actual
+/// core types are `slots` (the function's full flat signature, which
+/// carries variant joins); each read coerces from the joined type to
+/// the type this lift expects via emitSlotAs.
+fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const CoreType, slot: *usize) Error!void {
     switch (ty.kind) {
         .bool => {
-            try w.print("(p{d} != 0)", .{slot.*});
+            try w.writeAll("(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll(" != 0)");
             slot.* += 1;
         },
         .s8 => {
-            try w.print("@as(i8, @truncate(p{d}))", .{slot.*});
+            try w.writeAll("@as(i8, @truncate(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))");
             slot.* += 1;
         },
         .u8 => {
-            try w.print("@as(u8, @truncate(@as(u32, @bitCast(p{d}))))", .{slot.*});
+            try w.writeAll("@as(u8, @truncate(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))))");
             slot.* += 1;
         },
         .s16 => {
-            try w.print("@as(i16, @truncate(p{d}))", .{slot.*});
+            try w.writeAll("@as(i16, @truncate(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))");
             slot.* += 1;
         },
         .u16 => {
-            try w.print("@as(u16, @truncate(@as(u32, @bitCast(p{d}))))", .{slot.*});
+            try w.writeAll("@as(u16, @truncate(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))))");
             slot.* += 1;
         },
         .s32 => {
-            try w.print("p{d}", .{slot.*});
+            try emitSlotAs(w, slots, slot.*, .i32);
             slot.* += 1;
         },
         .u32 => {
-            try w.print("@as(u32, @bitCast(p{d}))", .{slot.*});
+            try w.writeAll("@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))");
             slot.* += 1;
         },
         .s64 => {
-            try w.print("p{d}", .{slot.*});
+            try emitSlotAs(w, slots, slot.*, .i64);
             slot.* += 1;
         },
         .u64 => {
-            try w.print("@as(u64, @bitCast(p{d}))", .{slot.*});
+            try w.writeAll("@as(u64, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i64);
+            try w.writeAll("))");
             slot.* += 1;
         },
-        .f32, .f64 => {
-            try w.print("p{d}", .{slot.*});
+        .f32 => {
+            try emitSlotAs(w, slots, slot.*, .f32);
+            slot.* += 1;
+        },
+        .f64 => {
+            try emitSlotAs(w, slots, slot.*, .f64);
             slot.* += 1;
         },
         .char => {
-            try w.print("@as(u21, @intCast(@as(u32, @bitCast(p{d}))))", .{slot.*});
+            try w.writeAll("abi.liftChar(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll(")))");
             slot.* += 1;
         },
         .string => {
             try w.writeAll("@as([*]const u8, @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(");
-            try w.print("p{d}", .{slot.*});
+            try emitSlotAs(w, slots, slot.*, .i32);
             try w.writeAll("))))))[0..@as(usize, @intCast(@as(u32, @bitCast(");
-            try w.print("p{d}", .{slot.* + 1});
+            try emitSlotAs(w, slots, slot.* + 1, .i32);
             try w.writeAll("))))]");
             slot.* += 2;
         },
         .list => |inner| {
-            try w.writeAll("@as([*]const ");
-            try emitTypeRef(w, r, inner.*);
-            try w.writeAll(", @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(");
-            try w.print("p{d}", .{slot.*});
-            try w.writeAll("))))))[0..@as(usize, @intCast(@as(u32, @bitCast(");
-            try w.print("p{d}", .{slot.* + 1});
-            try w.writeAll("))))]");
+            const p_slot = try slotAsAlloc(r.gpa, slots, slot.*, .i32);
+            defer r.gpa.free(p_slot);
+            const l_slot = try slotAsAlloc(r.gpa, slots, slot.* + 1, .i32);
+            defer r.gpa.free(l_slot);
+            const ptr_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(u32, @bitCast({s}))))", .{p_slot});
+            defer r.gpa.free(ptr_expr);
+            const len_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(u32, @bitCast({s}))))", .{l_slot});
+            defer r.gpa.free(len_expr);
+            try emitLiftListExpr(w, r, inner.*, ptr_expr, len_expr);
             slot.* += 2;
         },
         .own, .borrow => {
-            try w.print("@enumFromInt(@as(u32, @bitCast(p{d})))", .{slot.*});
+            try w.writeAll("@enumFromInt(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll(")))");
             slot.* += 1;
         },
         .option => |inner| {
             const n = r.label_counter;
             r.label_counter += 1;
-            try w.print("blk_o_{d}: {{ const _do_{d} = p{d}; break :blk_o_{d} if (_do_{d} == 0) null else ", .{ n, n, slot.*, n, n });
+            try w.print("blk_o_{d}: {{ const _do_{d} = ", .{ n, n });
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.print("; break :blk_o_{d} switch (_do_{d}) {{ 0 => null, 1 => ", .{ n, n });
             slot.* += 1;
-            try emitLiftFlat(w, r, inner.*, slot);
-            try w.writeAll("; }");
+            try emitLiftFlat(w, r, inner.*, slots, slot);
+            try w.writeAll(", else => abi.trap() }; }");
         },
         .result => |info| {
             const n = r.label_counter;
             r.label_counter += 1;
-            try w.print("blk_r_{d}: {{ const _dr_{d} = p{d}; break :blk_r_{d} switch (_dr_{d}) {{ 0 => .{{ .ok = ", .{ n, n, slot.*, n, n });
+            try w.print("blk_r_{d}: {{ const _dr_{d} = ", .{ n, n });
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.print("; break :blk_r_{d} switch (_dr_{d}) {{ 0 => .{{ .ok = ", .{ n, n });
             slot.* += 1;
             const after_disc = slot.*;
-            if (info.ok) |p| try emitLiftFlat(w, r, p.*, slot) else try w.writeAll("{}");
+            if (info.ok) |p| try emitLiftFlat(w, r, p.*, slots, slot) else try w.writeAll("{}");
             const ok_end = slot.*;
             try w.writeAll(" }, 1 => .{ .err = ");
             slot.* = after_disc;
-            if (info.err) |p| try emitLiftFlat(w, r, p.*, slot) else try w.writeAll("{}");
+            if (info.err) |p| try emitLiftFlat(w, r, p.*, slots, slot) else try w.writeAll("{}");
             const err_end = slot.*;
-            try w.writeAll(" }, else => unreachable }; }");
+            try w.writeAll(" }, else => abi.trap() }; }");
             slot.* = if (ok_end > err_end) ok_end else err_end;
         },
         .tuple => |elems| {
             try w.writeAll(".{ ");
             for (elems, 0..) |e, i| {
                 if (i != 0) try w.writeAll(", ");
-                try emitLiftFlat(w, r, e, slot);
+                try emitLiftFlat(w, r, e, slots, slot);
             }
             try w.writeAll(" }");
         },
@@ -1573,65 +1768,70 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slot: *usize) 
                         try w.writeAll(".");
                         try zigIdent(w, f.name);
                         try w.writeAll(" = ");
-                        try emitLiftFlat(w, r, f.ty, slot);
+                        try emitLiftFlat(w, r, f.ty, slots, slot);
                     }
                     try w.writeAll(" }");
                 },
                 .variant => |cases| {
                     const n = r.label_counter;
                     r.label_counter += 1;
-                    try w.print("blk_v_{d}: {{ const _dv_{d} = p{d}; break :blk_v_{d} switch (_dv_{d}) {{", .{ n, n, slot.*, n, n });
+                    try w.print("blk_v_{d}: {{ const _dv_{d} = ", .{ n, n });
+                    try emitSlotAs(w, slots, slot.*, .i32);
+                    try w.print("; break :blk_v_{d} switch (_dv_{d}) {{", .{ n, n });
                     slot.* += 1;
                     const after_disc = slot.*;
-                    // Find joined arity.
-                    const gpa = std.heap.page_allocator;
-                    var biggest: usize = 0;
-                    for (cases) |c| {
-                        if (c.ty == null) continue;
-                        var flat: std.ArrayList(CoreType) = .empty;
-                        defer flat.deinit(gpa);
-                        try flattenType(&flat, gpa, r, c.ty.?);
-                        if (flat.items.len > biggest) biggest = flat.items.len;
-                    }
+                    const joined = try variantJoinedPayload(r.gpa, r, cases);
+                    defer r.gpa.free(joined);
                     for (cases, 0..) |c, i| {
                         try w.print(" {d} => .{{ .", .{i});
                         try zigIdent(w, c.name);
                         if (c.ty) |pty| {
                             try w.writeAll(" = ");
                             slot.* = after_disc;
-                            try emitLiftFlat(w, r, pty, slot);
+                            try emitLiftFlat(w, r, pty, slots, slot);
                         } else try w.writeAll(" = {}");
                         try w.writeAll(" },");
                     }
-                    try w.writeAll(" else => unreachable }; }");
-                    slot.* = after_disc + biggest;
+                    try w.writeAll(" else => abi.trap() }; }");
+                    slot.* = after_disc + joined.len;
                 },
-                .@"enum" => |cases| {
-                    _ = cases;
-                    try w.print("@enumFromInt(@as(u32, @bitCast(p{d})))", .{slot.*});
+                .@"enum" => {
+                    try w.writeAll("abi.liftEnum(");
+                    try emitNamedTypeRef(w, r, nm);
+                    try w.writeAll(", @as(u32, @bitCast(");
+                    try emitSlotAs(w, slots, slot.*, .i32);
+                    try w.writeAll(")))");
                     slot.* += 1;
                 },
                 .flags => |labels| {
                     const w_count: usize = if (labels.len <= 32) 1 else if (labels.len <= 64) 2 else (labels.len + 31) / 32;
                     if (w_count == 1) {
                         const backing_bits = flagBackingBits(labels.len);
-                        try w.print("@bitCast(@as(u{d}, @truncate(@as(u32, @bitCast(p{d})))))", .{ backing_bits, slot.* });
+                        try w.print("@bitCast(@as(u{d}, @truncate(@as(u32, @bitCast(", .{backing_bits});
+                        try emitSlotAs(w, slots, slot.*, .i32);
+                        try w.writeAll(")))))");
                         slot.* += 1;
                     } else return Error.Unsupported;
                 },
-                .alias => |a| try emitLiftFlat(w, r, a, slot),
+                .alias => |a| try emitLiftFlat(w, r, a, slots, slot),
                 .resource => {
-                    try w.print("@enumFromInt(@as(u32, @bitCast(p{d})))", .{slot.*});
+                    try w.writeAll("@enumFromInt(@as(u32, @bitCast(");
+                    try emitSlotAs(w, slots, slot.*, .i32);
+                    try w.writeAll(")))");
                     slot.* += 1;
                 },
             }
         },
         .error_context => {
-            try w.print("@as(abi.ErrorContext, @enumFromInt(@as(u32, @bitCast(p{d}))))", .{slot.*});
+            try w.writeAll("@as(abi.ErrorContext, @enumFromInt(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll("))))");
             slot.* += 1;
         },
         .stream, .future => {
-            try w.print("@enumFromInt(@as(u32, @bitCast(p{d})))", .{slot.*});
+            try w.writeAll("@enumFromInt(@as(u32, @bitCast(");
+            try emitSlotAs(w, slots, slot.*, .i32);
+            try w.writeAll(")))");
             slot.* += 1;
         },
         .list_fixed => |info| {
@@ -1639,7 +1839,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slot: *usize) 
             var i: u32 = 0;
             while (i < info.len) : (i += 1) {
                 if (i != 0) try w.writeAll(", ");
-                try emitLiftFlat(w, r, info.elem.*, slot);
+                try emitLiftFlat(w, r, info.elem.*, slots, slot);
             }
             try w.writeAll(" }");
         },
@@ -1647,41 +1847,12 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slot: *usize) 
 }
 
 /// Emit Zig code that, given a value `expr` of WIT type `ty`,
-/// produces a single flat core value of `core` to be returned. Only
-/// valid when the type has exactly one flat representation slot.
+/// produces a single flat core value to be returned. Only valid when
+/// the type has exactly one flat representation slot; delegates to
+/// the slot-projection walk, which also handles single-flat records
+/// and payload-less variants.
 fn emitLowerDirect(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []const u8) Error!void {
-    switch (ty.kind) {
-        .bool => try w.print("@as(i32, if ({s}) 1 else 0)", .{expr}),
-        .s8 => try w.print("@as(i32, {s})", .{expr}),
-        .u8 => try w.print("@as(i32, @bitCast(@as(u32, {s})))", .{expr}),
-        .s16 => try w.print("@as(i32, {s})", .{expr}),
-        .u16 => try w.print("@as(i32, @bitCast(@as(u32, {s})))", .{expr}),
-        .s32 => try w.print("{s}", .{expr}),
-        .u32 => try w.print("@as(i32, @bitCast({s}))", .{expr}),
-        .s64 => try w.print("{s}", .{expr}),
-        .u64 => try w.print("@as(i64, @bitCast({s}))", .{expr}),
-        .f32, .f64 => try w.print("{s}", .{expr}),
-        .char => try w.print("@as(i32, @bitCast(@as(u32, {s})))", .{expr}),
-        .own, .borrow, .error_context, .stream, .future => try w.print("@as(i32, @bitCast(@intFromEnum({s})))", .{expr}),
-        .named => |nm| {
-            const td = r.find(nm) orelse return Error.UnknownType;
-            switch (td.body) {
-                .@"enum" => try w.print("@as(i32, @bitCast(@as(u32, @intFromEnum({s}))))", .{expr}),
-                .resource => try w.print("@as(i32, @bitCast(@intFromEnum({s})))", .{expr}),
-                .flags => |labels| {
-                    if (labels.len > 32) return Error.Unsupported;
-                    const backing_bits = flagBackingBits(labels.len);
-                    try w.print("@as(i32, @bitCast(@as(u32, @as(u{d}, @bitCast({s})))))", .{ backing_bits, expr });
-                },
-                .alias => |a| try emitLowerDirect(w, r, a, expr),
-                .record, .variant => return Error.Unsupported,
-            }
-        },
-        // Empty option/result with no payload flatten to one discriminant slot.
-        .option => try w.print("@as(i32, if ({s} == null) 0 else 1)", .{expr}),
-        .result => try w.print("@as(i32, @intFromEnum({s}))", .{expr}),
-        else => return Error.Unsupported,
-    }
+    try emitFlatSlotExpr(w, r, ty, expr, 0);
 }
 
 // =====================================================================
@@ -1690,6 +1861,7 @@ fn emitLowerDirect(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []con
 
 fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func, opts: Options) Error!void {
     if (f.is_async) return emitImportDeclAsync(w, r, name, f, opts);
+    if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
     var flat_params: std.ArrayList(CoreType) = .empty;
     defer flat_params.deinit(gpa);
@@ -1698,9 +1870,6 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
     var flat_results: std.ArrayList(CoreType) = .empty;
     defer flat_results.deinit(gpa);
     if (f.results.len == 1) try flattenType(&flat_results, gpa, r, f.results[0].ty);
-    if (f.results.len > 1) {
-        for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
-    }
     const indirect_results = flat_results.items.len > 1;
     // Canonical ABI: when total flat-params exceed MAX_FLAT_PARAMS (16),
     // all parameters go through a single i32 pointer to a memory area
@@ -1744,14 +1913,12 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
     try w.writeAll(") ");
     if (f.results.len == 0) {
         try w.writeAll("void");
-    } else if (f.results.len == 1) {
-        try emitTypeRef(w, r, f.results[0].ty);
     } else {
-        try w.writeAll("void");
+        try emitTypeRef(w, r, f.results[0].ty);
     }
     try w.writeAll(" {\n");
     if (indirect_results) {
-        const l = try jointLayout(r, f.results);
+        const l = try layoutOf(r, f.results[0].ty);
         try w.print("        var _retarea: [{d}]u8 align({d}) = undefined;\n", .{ l.size, l.@"align" });
     }
     var arg_idx: usize = 0;
@@ -1778,7 +1945,7 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
         try emitLowerImportSlots(w, r, p.ty, expr_buf, &arg_idx);
     }
     try w.writeAll("        ");
-    if (f.results.len != 0 and !indirect_results) try w.writeAll("const _r = ");
+    if (!indirect_results and flat_results.items.len == 1) try w.writeAll("const p0 = ");
     try w.writeAll("_import_");
     try zigIdent(w, name);
     try w.writeAll(".*(");
@@ -1792,36 +1959,19 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
         try w.writeAll("@bitCast(@as(u32, @intCast(@intFromPtr(&_retarea))))");
     }
     try w.writeAll(");\n");
-    if (f.results.len != 0 and !indirect_results) {
-        switch (f.results[0].ty.kind) {
-            .u32, .u8, .u16, .char => try w.writeAll("        return @bitCast(_r);\n"),
-            .u64 => try w.writeAll("        return @bitCast(_r);\n"),
-            .result => try w.writeAll("        return if (_r == 0) .{ .ok = {} } else .{ .err = {} };\n"),
-            .option => try w.writeAll("        return if (_r == 0) null else .{ .ok = {} };\n"),
-            .own, .borrow, .error_context, .stream, .future => try w.writeAll("        return @enumFromInt(@as(u32, @bitCast(_r)));\n"),
-            .named => |nm| {
-                if (resolveAliasTo(r, nm)) |kind| switch (kind) {
-                    .bool => try w.writeAll("        return _r != 0;\n"),
-                    .s32, .s64, .f32, .f64 => try w.writeAll("        return _r;\n"),
-                    .s8, .s16 => try w.writeAll("        return @intCast(_r);\n"),
-                    .u32, .u64 => try w.writeAll("        return @bitCast(_r);\n"),
-                    .u8, .u16, .char => try w.writeAll("        return @intCast(@as(u32, @bitCast(_r)));\n"),
-                    .result => try w.writeAll("        return if (_r == 0) .{ .ok = {} } else .{ .err = {} };\n"),
-                    .option => try w.writeAll("        return if (_r == 0) null else .{ .ok = {} };\n"),
-                    else => try w.writeAll("        return @enumFromInt(@as(u32, @bitCast(_r)));\n"),
-                } else try w.writeAll("        return @enumFromInt(@as(u32, @bitCast(_r)));\n");
-            },
-            .bool => try w.writeAll("        return _r != 0;\n"),
-            .s32, .s8, .s16, .s64, .f32, .f64 => try w.writeAll("        return _r;\n"),
-            else => try w.writeAll("        return @bitCast(_r);\n"),
-        }
-    } else if (indirect_results and f.results.len == 1) {
+    if (f.results.len == 1 and !indirect_results) {
+        // Direct result: the single flat return value (or none for
+        // zero-flat types like an empty record) lifts through the
+        // standard flat walk, aliased as slot p0.
+        var slot: usize = 0;
+        try w.writeAll("        return ");
+        try emitLiftFlat(w, r, f.results[0].ty, flat_results.items, &slot);
+        try w.writeAll(";\n");
+    } else if (indirect_results) {
         try w.writeAll("        const _base: usize = @intFromPtr(&_retarea);\n");
         try w.writeAll("        return ");
         try emitLoadMem(w, r, f.results[0].ty, "_base", 0);
         try w.writeAll(";\n");
-    } else if (indirect_results and f.results.len > 1) {
-        try w.writeAll("        @compileError(\"multi-result imports are not yet supported\");\n");
     }
     try w.writeAll("    }\n");
 
@@ -1844,17 +1994,11 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
 /// path), which is the right default for a guest that doesn't itself
 /// run a task scheduler. Real coroutine drive can be layered on later.
 fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func, opts: Options) Error!void {
+    if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
     var flat_params: std.ArrayList(CoreType) = .empty;
     defer flat_params.deinit(gpa);
     for (f.params) |p| try flattenType(&flat_params, gpa, r, p.ty);
-
-    var flat_results: std.ArrayList(CoreType) = .empty;
-    defer flat_results.deinit(gpa);
-    if (f.results.len == 1) try flattenType(&flat_results, gpa, r, f.results[0].ty);
-    if (f.results.len > 1) {
-        for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
-    }
 
     const indirect_params = flat_params.items.len > 4; // MAX_FLAT_ASYNC_PARAMS
     const has_result = f.results.len != 0;
@@ -1892,10 +2036,8 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
     try w.writeAll(") ");
     if (f.results.len == 0) {
         try w.writeAll("void");
-    } else if (f.results.len == 1) {
-        try emitTypeRef(w, r, f.results[0].ty);
     } else {
-        try w.writeAll("void");
+        try emitTypeRef(w, r, f.results[0].ty);
     }
     try w.writeAll(" {\n");
 
@@ -1903,10 +2045,7 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
     // async-lower convention requires a pointer-out param even for
     // single-flat results).
     if (has_result) {
-        const l = if (f.results.len == 1)
-            try layoutOf(r, f.results[0].ty)
-        else
-            try jointLayout(r, f.results);
+        const l = try layoutOf(r, f.results[0].ty);
         try w.print("        var _retarea: [{d}]u8 align({d}) = undefined;\n", .{ l.size, l.@"align" });
     }
 
@@ -1975,14 +2114,10 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
     try w.writeAll("        }\n");
 
     if (has_result) {
-        if (f.results.len == 1) {
-            try w.writeAll("        const _base: usize = @intFromPtr(&_retarea);\n");
-            try w.writeAll("        return ");
-            try emitLoadMem(w, r, f.results[0].ty, "_base", 0);
-            try w.writeAll(";\n");
-        } else {
-            try w.writeAll("        @compileError(\"multi-result async imports are not yet supported\");\n");
-        }
+        try w.writeAll("        const _base: usize = @intFromPtr(&_retarea);\n");
+        try w.writeAll("        return ");
+        try emitLoadMem(w, r, f.results[0].ty, "_base", 0);
+        try w.writeAll(";\n");
     }
     try w.writeAll("    }\n");
 
@@ -1998,6 +2133,7 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
 
 fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: []const u8, alias_prefix: []const u8, f: wit.Func) Error!void {
     if (f.is_async) return emitCabiExportAsync(w, r, name, dispatch, alias_prefix, f);
+    if (f.results.len > 1) return Error.Unsupported;
 
     const gpa = std.heap.page_allocator;
     var flat_params: std.ArrayList(CoreType) = .empty;
@@ -2007,9 +2143,6 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
     var flat_results: std.ArrayList(CoreType) = .empty;
     defer flat_results.deinit(gpa);
     if (f.results.len == 1) try flattenType(&flat_results, gpa, r, f.results[0].ty);
-    if (f.results.len > 1) {
-        for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
-    }
 
     const indirect_params = flat_params.items.len > 16;
     const indirect_results = flat_results.items.len > 1;
@@ -2034,6 +2167,7 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
         try w.writeAll(flat_results.items[0].zigName());
     }
     try w.writeAll(" {\n");
+    try w.writeAll("    realloc_state.enterTask();\n");
 
     // Lift parameters.
     if (indirect_params) {
@@ -2059,7 +2193,7 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
             try w.writeAll(": ");
             try emitParamType(w, r, alias_prefix, p);
             try w.writeAll(" = ");
-            try emitLiftFlat(w, r, p.ty, &slot);
+            try emitLiftFlat(w, r, p.ty, flat_params.items, &slot);
             try w.writeAll(";\n");
         }
     }
@@ -2079,6 +2213,9 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
 
     if (f.results.len == 0) {
         // nothing
+    } else if (flat_results.items.len == 0) {
+        // Zero-flat result (e.g. an empty record): nothing to lower.
+        try w.writeAll("    _ = _result;\n");
     } else if (!indirect_results) {
         try w.writeAll("    return ");
         try emitLowerDirect(w, r, f.results[0].ty, "_result");
@@ -2086,19 +2223,7 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
     } else {
         const ret_buf_name = try retareaNameAlloc(gpa, name);
         defer gpa.free(ret_buf_name);
-        if (f.results.len == 1) {
-            try emitStoreMem(w, r, f.results[0].ty, "_result", ret_buf_name, 0);
-        } else {
-            var off: u32 = 0;
-            for (f.results) |res| {
-                const l = try layoutOf(r, res.ty);
-                off = alignTo(off, l.@"align");
-                const field_expr = try std.fmt.allocPrint(gpa, "_result.{f}", .{std.zig.fmtId(res.name)});
-                defer gpa.free(field_expr);
-                try emitStoreMem(w, r, res.ty, field_expr, ret_buf_name, off);
-                off += l.size;
-            }
-        }
+        try emitStoreMem(w, r, f.results[0].ty, "_result", ret_buf_name, 0);
         try w.writeAll("    return @bitCast(@as(u32, @intCast(");
         try w.writeAll(ret_buf_name);
         try w.writeAll(")));\n");
@@ -2127,6 +2252,7 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
 /// implementation). The callback export is still generated so the
 /// canon lift is valid; it just traps if it's ever called.
 fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: []const u8, alias_prefix: []const u8, f: wit.Func) Error!void {
+    if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
     var flat_params: std.ArrayList(CoreType) = .empty;
     defer flat_params.deinit(gpa);
@@ -2135,9 +2261,6 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     var flat_results: std.ArrayList(CoreType) = .empty;
     defer flat_results.deinit(gpa);
     if (f.results.len == 1) try flattenType(&flat_results, gpa, r, f.results[0].ty);
-    if (f.results.len > 1) {
-        for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
-    }
 
     // Async exports still cap params at MAX_FLAT_PARAMS=16 on the lift
     // side (the MAX_FLAT_ASYNC_PARAMS=4 cap only applies to async-lower
@@ -2206,10 +2329,8 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     try w.writeAll(") void {\n");
     if (f.results.len == 0) {
         try w.print("    {s}.*();\n", .{tr_ident});
-    } else if (f.results.len == 1) {
-        try emitTaskReturnLowering(w, r, gpa, f, name, tr_ident, "_value", indirect_results);
     } else {
-        try w.writeAll("    @compileError(\"multi-result async exports are not supported (WIT deprecates them at embed time)\");\n");
+        try emitTaskReturnLowering(w, r, gpa, f, name, tr_ident, "_value", indirect_results);
     }
     try w.writeAll("}\n\n");
 
@@ -2226,6 +2347,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
         }
     }
     try w.writeAll(") i32 {\n");
+    try w.writeAll("    realloc_state.enterTask();\n");
 
     if (indirect_params) {
         try w.writeAll("    const _args_base: usize = @intCast(@as(u32, @bitCast(args_ptr)));\n");
@@ -2250,7 +2372,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
             try w.writeAll(": ");
             try emitParamType(w, r, alias_prefix, p);
             try w.writeAll(" = ");
-            try emitLiftFlat(w, r, p.ty, &slot);
+            try emitLiftFlat(w, r, p.ty, flat_params.items, &slot);
             try w.writeAll(";\n");
         }
     }
@@ -2304,24 +2426,11 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
         try emitTaskReturnLowering(w, r, gpa, f, name, tr_ident, "_result", indirect_results);
     }
 
-    // Reset the realloc arena now — wit-component rejects post-return
-    // clauses on async exports ("cannot specify post-return function in
-    // async"). task.return has already copied/consumed any indirect
-    // result by the time we get here, so resetting the bump arena is
-    // safe and matches what the sync cabi_post hook would have done.
-    try w.writeAll("        realloc_state.reset();\n");
-    // The minimal state-machine hook: ask `async_cleanup` for the
-    // CallbackCode-packed value to return. If the user scheduled
-    // cleanup with `schedule(set, fn)`, the [async-lift] yields back
-    // to the runtime (WAIT(set) when set != 0, YIELD when set == 0);
-    // the [callback] then runs the cleanup and returns EXIT. With
-    // nothing scheduled this is just an unconditional `return 0`
-    // (EXIT) — the eager-completion path.
-    try w.writeAll("        return abi.async_cleanup.lift_outcome();\n");
+    try emitCleanupOutcomeEpilogue(w);
     try w.writeAll("    }\n}\n\n");
 
     if (indirect_results) {
-        const l = try jointLayout(r, f.results);
+        const l = try layoutOf(r, f.results[0].ty);
         try w.writeAll("var ");
         try emitRetareaIdent(w, name);
         try w.print(": [{d}]u8 align({d}) = undefined;\n\n", .{ l.size, l.@"align" });
@@ -2350,7 +2459,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     try w.writeAll("    } else {\n");
     try w.writeAll("        _ = .{ event0, p1, p2 };\n");
     try w.writeAll("        _ = abi.async_cleanup.run();\n");
-    try w.writeAll("        return abi.async_cleanup.lift_outcome();\n");
+    try emitCleanupOutcomeEpilogue(w);
     try w.writeAll("    }\n}\n\n");
 
     // Per-function stream/future intrinsics live in `[export]<iface>`.
@@ -2359,18 +2468,32 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     try emitFuncStreamFutureIntrinsics(w, r, tr_module, tr_func, name, f);
 }
 
+/// Emit the tail that closes the eager branch of both `[async-lift]`
+/// and `[callback]`: return the CallbackCode chosen by
+/// `async_cleanup` (EXIT when nothing is scheduled, YIELD/WAIT to
+/// re-enter the callback otherwise). The task only counts as done —
+/// and may only release its share of the realloc arena — once it
+/// actually EXITs; wit-component rejects post-return clauses on
+/// async exports, so the inline exitTask stands in for the sync
+/// cabi_post hook.
+fn emitCleanupOutcomeEpilogue(w: *std.Io.Writer) Error!void {
+    try w.writeAll("        const _outcome = abi.async_cleanup.lift_outcome();\n");
+    try w.writeAll("        if (_outcome == 0) realloc_state.exitTask();\n");
+    try w.writeAll("        return _outcome;\n");
+}
+
 /// Emit the `switch (_step) { .exit => …, .yield => …, .wait => … }`
 /// block that closes both the `[async-lift]` and the `[callback]`
-/// state-machine branch. `.exit` resets the realloc arena, frees the
-/// state slot, and returns EXIT (0). `.yield` returns YIELD (1).
-/// `.wait` packs the waitable-set handle into WAIT(set) — 2 | (set << 4).
-/// `task.return` is decoupled from the variant: the user has already
-/// called the typed `taskReturn` thunk from inside start/step at the
-/// appropriate moment.
+/// state-machine branch. `.exit` retires the task's share of the
+/// realloc arena, frees the state slot, and returns EXIT (0).
+/// `.yield` returns YIELD (1). `.wait` packs the waitable-set handle
+/// into WAIT(set) — 2 | (set << 4). `task.return` is decoupled from
+/// the variant: the user has already called the typed `taskReturn`
+/// thunk from inside start/step at the appropriate moment.
 fn emitStepDispatch(w: *std.Io.Writer) Error!void {
     try w.writeAll("        switch (_step) {\n");
     try w.writeAll("            .exit => {\n");
-    try w.writeAll("                realloc_state.reset();\n");
+    try w.writeAll("                realloc_state.exitTask();\n");
     try w.writeAll("                _Slots.free();\n");
     try w.writeAll("                return 0;\n");
     try w.writeAll("            },\n");
@@ -2399,26 +2522,20 @@ fn emitTaskReturnLowering(
         try w.print("    {s}.*();\n", .{tr_ident});
         return;
     }
+    if (f.results.len > 1) return Error.Unsupported;
+    const ty = f.results[0].ty;
     if (!indirect_results) {
         var flat_count: std.ArrayList(CoreType) = .empty;
         defer flat_count.deinit(gpa);
-        for (f.results) |res| try flattenType(&flat_count, gpa, r, res.ty);
-        if (f.results.len == 1 and flat_count.items.len == 1) {
+        try flattenType(&flat_count, gpa, r, ty);
+        if (flat_count.items.len == 1) {
             try w.print("    {s}.*(", .{tr_ident});
-            try emitLowerDirect(w, r, f.results[0].ty, result_var);
+            try emitLowerDirect(w, r, ty, result_var);
             try w.writeAll(");\n");
             return;
         }
         var slot: usize = 0;
-        if (f.results.len == 1) {
-            try emitLowerImportSlots(w, r, f.results[0].ty, result_var, &slot);
-        } else {
-            for (f.results) |res| {
-                const field_expr = try std.fmt.allocPrint(gpa, "{s}.{f}", .{ result_var, std.zig.fmtId(res.name) });
-                defer gpa.free(field_expr);
-                try emitLowerImportSlots(w, r, res.ty, field_expr, &slot);
-            }
-        }
+        try emitLowerImportSlots(w, r, ty, result_var, &slot);
         try w.print("    {s}.*(", .{tr_ident});
         for (0..slot) |i| {
             if (i != 0) try w.writeAll(", ");
@@ -2429,19 +2546,7 @@ fn emitTaskReturnLowering(
     }
     const ret_buf_name = try retareaNameAlloc(gpa, name);
     defer gpa.free(ret_buf_name);
-    if (f.results.len == 1) {
-        try emitStoreMem(w, r, f.results[0].ty, result_var, ret_buf_name, 0);
-    } else {
-        var off: u32 = 0;
-        for (f.results) |res| {
-            const l = try layoutOf(r, res.ty);
-            off = alignTo(off, l.@"align");
-            const field_expr = try std.fmt.allocPrint(gpa, "{s}.{f}", .{ result_var, std.zig.fmtId(res.name) });
-            defer gpa.free(field_expr);
-            try emitStoreMem(w, r, res.ty, field_expr, ret_buf_name, off);
-            off += l.size;
-        }
-    }
+    try emitStoreMem(w, r, ty, result_var, ret_buf_name, 0);
     try w.print("    {s}.*(@bitCast(@as(u32, @intCast(", .{tr_ident});
     try w.writeAll(ret_buf_name);
     try w.writeAll("))));\n");
@@ -2748,7 +2853,7 @@ fn emitRetareaAndPostReturn(
     flat_results: []const CoreType,
 ) Error!void {
     if (indirect_results) {
-        const l = try jointLayout(r, results);
+        const l = try layoutOf(r, results[0].ty);
         try w.writeAll("var ");
         try emitRetareaIdent(w, name);
         try w.print(": [{d}]u8 align({d}) = undefined;\n", .{ l.size, l.@"align" });
@@ -2765,7 +2870,7 @@ fn emitRetareaAndPostReturn(
     try w.writeAll(") void {\n");
     if (indirect_results) try w.writeAll("    _ = _ptr;\n");
     if (!indirect_results and flat_results.len == 1) try w.writeAll("    _ = _r;\n");
-    try w.writeAll("    realloc_state.reset();\n}\n\n");
+    try w.writeAll("    realloc_state.exitTask();\n}\n\n");
 }
 
 fn retareaNameAlloc(gpa: Allocator, fn_name: []const u8) Allocator.Error![]u8 {
@@ -2773,24 +2878,6 @@ fn retareaNameAlloc(gpa: Allocator, fn_name: []const u8) Allocator.Error![]u8 {
         return std.fmt.allocPrint(gpa, "@intFromPtr(&@\"_retarea_{s}\")", .{fn_name});
     }
     return std.fmt.allocPrint(gpa, "@intFromPtr(&_retarea_{s})", .{fn_name});
-}
-
-/// If `name` resolves (possibly through alias chains) to a primitive
-/// TypeRef.Kind, return it. Otherwise null.
-fn resolveAliasTo(r: *Resolver, name: []const u8) ?wit.TypeRef.Kind {
-    var cur_name = name;
-    var depth: usize = 0;
-    while (depth < 32) : (depth += 1) {
-        const td = r.find(cur_name) orelse return null;
-        switch (td.body) {
-            .alias => |a| switch (a.kind) {
-                .named => |n| cur_name = n,
-                else => |k| return k,
-            },
-            else => return null,
-        }
-    }
-    return null;
 }
 
 fn nameNeedsEscape(name: []const u8) bool {
@@ -3328,6 +3415,7 @@ fn emitResourceMemberImport(
     m: wit.ResourceMember,
 ) Error!void {
     const f = m.func;
+    if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
 
     var flat_params: std.ArrayList(CoreType) = .empty;
@@ -3341,8 +3429,6 @@ fn emitResourceMemberImport(
         try flat_results.append(gpa, .i32);
     } else if (f.results.len == 1) {
         try flattenType(&flat_results, gpa, r, f.results[0].ty);
-    } else if (f.results.len > 1) {
-        for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
     }
     const indirect_results = flat_results.items.len > 1;
     const indirect_params = flat_params.items.len > 16;
@@ -3391,10 +3477,8 @@ fn emitResourceMemberImport(
         try zigIdent(w, res_name);
     } else if (f.results.len == 0) {
         try w.writeAll("void");
-    } else if (f.results.len == 1) {
-        try emitTypeRef(w, r, f.results[0].ty);
     } else {
-        try w.writeAll("void");
+        try emitTypeRef(w, r, f.results[0].ty);
     }
     try w.writeAll(" {\n");
 
@@ -3435,12 +3519,15 @@ fn emitResourceMemberImport(
     }
 
     if (indirect_results) {
-        const l = try jointLayout(r, f.results);
+        const l = try layoutOf(r, f.results[0].ty);
         try w.print("                var _retarea: [{d}]u8 align({d}) = undefined;\n", .{ l.size, l.@"align" });
     }
     try w.writeAll("                ");
-    if (f.results.len != 0 and !indirect_results) try w.writeAll("const _r = ");
-    if (m.kind == .constructor) try w.writeAll("const _r = ");
+    if (m.kind == .constructor) {
+        try w.writeAll("const _r = ");
+    } else if (!indirect_results and flat_results.items.len == 1) {
+        try w.writeAll("const p0 = ");
+    }
     try w.writeAll("_");
     try zigIdent(w, zig_fn_name);
     try w.writeAll(".*(");
@@ -3457,29 +3544,11 @@ fn emitResourceMemberImport(
 
     if (m.kind == .constructor) {
         try w.writeAll("                return @enumFromInt(@as(u32, @bitCast(_r)));\n");
-    } else if (f.results.len != 0 and !indirect_results) {
-        switch (f.results[0].ty.kind) {
-            .u32, .u8, .u16, .char => try w.writeAll("                return @bitCast(_r);\n"),
-            .u64 => try w.writeAll("                return @bitCast(_r);\n"),
-            .result => try w.writeAll("                return if (_r == 0) .{ .ok = {} } else .{ .err = {} };\n"),
-            .option => try w.writeAll("                return if (_r == 0) null else .{ .ok = {} };\n"),
-            .bool => try w.writeAll("                return _r != 0;\n"),
-            .s32, .s8, .s16, .s64, .f32, .f64 => try w.writeAll("                return _r;\n"),
-            .own, .borrow, .error_context, .stream, .future => try w.writeAll("                return @enumFromInt(@as(u32, @bitCast(_r)));\n"),
-            .named => |nm| {
-                if (resolveAliasTo(r, nm)) |kind| switch (kind) {
-                    .bool => try w.writeAll("                return _r != 0;\n"),
-                    .s32, .s64, .f32, .f64 => try w.writeAll("                return _r;\n"),
-                    .s8, .s16 => try w.writeAll("                return @intCast(_r);\n"),
-                    .u32, .u64 => try w.writeAll("                return @bitCast(_r);\n"),
-                    .u8, .u16, .char => try w.writeAll("                return @intCast(@as(u32, @bitCast(_r)));\n"),
-                    .result => try w.writeAll("                return if (_r == 0) .{ .ok = {} } else .{ .err = {} };\n"),
-                    .option => try w.writeAll("                return if (_r == 0) null else .{ .ok = {} };\n"),
-                    else => try w.writeAll("                return @enumFromInt(@as(u32, @bitCast(_r)));\n"),
-                } else try w.writeAll("                return @enumFromInt(@as(u32, @bitCast(_r)));\n");
-            },
-            else => try w.writeAll("                return @bitCast(_r);\n"),
-        }
+    } else if (f.results.len == 1 and !indirect_results) {
+        var slot: usize = 0;
+        try w.writeAll("                return ");
+        try emitLiftFlat(w, r, f.results[0].ty, flat_results.items, &slot);
+        try w.writeAll(";\n");
     } else if (indirect_results and f.results.len == 1) {
         try w.writeAll("                const _base: usize = @intFromPtr(&_retarea);\n");
         try w.writeAll("                return ");
@@ -3617,7 +3686,7 @@ fn findWorldWithPkg(pkg: *const wit.Package, path: wit.PackagePath) ?WorldLookup
 ///   * `<iface>#[constructor]<res>`  → returns an i32 rep
 ///   * `<iface>#[method]<res>.<m>`   → takes rep as first param
 ///   * `<iface>#[static]<res>.<m>`   → no implicit rep
-///   * `<iface>#[resource-drop]<res>` → called when handle dies
+///   * `<iface>#[dtor]<res>`         → called when the last own handle dies
 ///
 /// The user implements each as `wit_exports.<iface>.<res>.<m>(...)`.
 /// The rep is whatever the constructor returns (commonly a `*T`),
@@ -3628,10 +3697,9 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
 
     // Declare the canonical-ABI handle-table helpers as imports from
     // the matching `[export]<iface>` module. The constructor calls
-    // `[resource-new]<T>(rep)` to register a new handle; the
-    // [resource-drop] import is invoked implicitly by the runtime
-    // when a handle is dropped (we provide an export wrapper for it
-    // below) and so does not need an `@extern` import here.
+    // `[resource-new]<T>(rep)` to register a new handle; the dtor is
+    // wired by wit-component from the `[dtor]<res>` export emitted
+    // below and so does not need an `@extern` import here.
     {
         const lib = try std.fmt.allocPrint(gpa_top, "[export]{s}", .{wasm_iface});
         defer gpa_top.free(lib);
@@ -3647,6 +3715,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
     const gpa = std.heap.page_allocator;
     for (members) |m| {
         const f = m.func;
+        if (f.results.len > 1) return Error.Unsupported;
         var flat_params: std.ArrayList(CoreType) = .empty;
         defer flat_params.deinit(gpa);
         if (m.kind == .method) try flat_params.append(gpa, .i32); // self rep
@@ -3658,8 +3727,6 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
             try flat_results.append(gpa, .i32);
         } else if (f.results.len == 1) {
             try flattenType(&flat_results, gpa, r, f.results[0].ty);
-        } else if (f.results.len > 1) {
-            for (f.results) |p| try flattenType(&flat_results, gpa, r, p.ty);
         }
 
         const tag = switch (m.kind) {
@@ -3703,6 +3770,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
             try w.writeAll(flat_results.items[0].zigName());
         }
         try w.writeAll(" {\n");
+        try w.writeAll("    realloc_state.enterTask();\n");
 
         if (indirect_params) {
             try w.writeAll("    const _args_base: usize = @intCast(@as(u32, @bitCast(args_ptr)));\n");
@@ -3744,7 +3812,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
                 try w.writeAll(": ");
                 try emitTypeRef(w, r, p.ty);
                 try w.writeAll(" = ");
-                try emitLiftFlat(w, r, p.ty, &slot);
+                try emitLiftFlat(w, r, p.ty, flat_params.items, &slot);
                 try w.writeAll(";\n");
             }
         }
@@ -3761,11 +3829,15 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
             }
             try w.writeAll(");\n");
             // Wrap the rep in a handle via the canonical-ABI's
-            // `[resource-new]<T>` host import.
+            // `[resource-new]<T>` host import. Constructors have no
+            // post-return hook, so the task retires inline — the
+            // returned handle is a scalar and needs no arena data.
             try w.writeAll("    const _rep: i32 = @bitCast(@as(u32, @intCast(@intFromPtr(_result))));\n");
-            try w.writeAll("    return _resource_new_");
+            try w.writeAll("    const _handle = _resource_new_");
             try zigIdent(w, res_name);
             try w.writeAll(".*(_rep);\n");
+            try w.writeAll("    realloc_state.exitTask();\n");
+            try w.writeAll("    return _handle;\n");
         } else {
             try w.writeAll("    ");
             if (f.results.len != 0) try w.writeAll("const _result = ");
@@ -3786,22 +3858,19 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
             }
             try w.writeAll(");\n");
             if (f.results.len != 0) {
-                if (!indirect_results) {
+                if (flat_results.items.len == 0) {
+                    try w.writeAll("    _ = _result;\n");
+                } else if (!indirect_results) {
                     try w.writeAll("    return ");
                     try emitLowerDirect(w, r, f.results[0].ty, "_result");
                     try w.writeAll(";\n");
-                } else if (f.results.len == 1) {
-                    // Indirect single-result: store into a static
-                    // retarea sized to the result's joint layout and
-                    // return its address.
+                } else {
                     const ret_buf = try retareaNameAlloc(gpa, wasm_name);
                     defer gpa.free(ret_buf);
                     try emitStoreMem(w, r, f.results[0].ty, "_result", ret_buf, 0);
                     try w.writeAll("    return @bitCast(@as(u32, @intCast(");
                     try w.writeAll(ret_buf);
                     try w.writeAll(")));\n");
-                } else {
-                    try w.writeAll("    @compileError(\"multi-result resource methods not supported (WIT spec deprecated them)\");\n");
                 }
             }
         }
@@ -3812,15 +3881,16 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
         }
     }
 
-    // Auto-emit a `[resource-drop]` export that calls the user's
-    // destructor with the rep.
+    // Auto-emit the `[dtor]` export wit-component wires as the
+    // resource type's destructor; the runtime invokes it with the rep
+    // when the last own handle drops.
     try w.writeAll("export fn ");
     {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
         try buf.appendSlice(gpa, wasm_iface);
         try buf.append(gpa, '#');
-        try buf.appendSlice(gpa, "[resource-drop]");
+        try buf.appendSlice(gpa, "[dtor]");
         try buf.appendSlice(gpa, res_name);
         try zigExportIdent(w, buf.items);
     }
@@ -4039,7 +4109,8 @@ test "exported resource method with composite return emits retarea + post-return
     // path with a static retarea and a post-return hook.
     try testing.expect(std.mem.indexOf(u8, src, "_retarea_demo") != null);
     try testing.expect(std.mem.indexOf(u8, src, "cabi_post_demo") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.reset()") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.enterTask()") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.exitTask()") != null);
 }
 
 test "fixed-length list (list<T, N>) lifts to [N]T and round-trips memory" {
@@ -4110,9 +4181,11 @@ test "async export emits [async-lift]/[callback]/[task-return] trio" {
     try testing.expect(std.mem.indexOf(u8, src, "@\"[callback][async-lift]demo:x/kit@0.1.0#delay\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, ".name = \"[task-return]delay\", .library_name = \"[export]demo:x/kit@0.1.0\"") != null);
     // The callback chains back through async_cleanup so multi-step
-    // producers can re-schedule themselves from inside the cleanup.
+    // producers can re-schedule themselves from inside the cleanup,
+    // and the task's arena share is only released on EXIT.
     try testing.expect(std.mem.indexOf(u8, src, "_ = abi.async_cleanup.run();") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "return abi.async_cleanup.lift_outcome();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const _outcome = abi.async_cleanup.lift_outcome();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "if (_outcome == 0) realloc_state.exitTask();") != null);
 }
 
 test "async export emits typed state-machine dispatch and taskReturn thunk" {
@@ -4347,6 +4420,199 @@ test "export returning flags / enum / alias-of-primitive lowers correctly" {
     // Alias-of-u16 follows the alias chain; lowers like a u16 (intCast via u32).
     try testing.expect(std.mem.indexOf(u8, src, "@as(u32, _result)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "Error.Unsupported") == null);
+}
+
+test "f32/u32 variant joins to i32 with bit-level reinterpret on both sides" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  variant mix { flt(f32), num(u32) }
+        \\  import send: func(m: mix);
+        \\  export make: func(m: mix) -> mix;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // Spec join(f32, i32) == i32, so the lowered import takes (i32, i32).
+    try testing.expect(std.mem.indexOf(u8, src, "@extern(*const fn (i32, i32) callconv(.c) void") != null);
+    // Lowering the f32 case reinterprets its bits into the i32 slot.
+    try testing.expect(std.mem.indexOf(u8, src, ".flt => |_v0| @as(i32, @bitCast(_v0))") != null);
+    // The export lifts with the matching (i32, i32) core signature and
+    // decodes the f32 case from the joined i32 slot.
+    try testing.expect(std.mem.indexOf(u8, src, "export fn make(p0: i32, p1: i32) i32") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".{ .flt = @as(f32, @bitCast(p1)) }") != null);
+}
+
+test "u32/u64 and f64/u64 variant joins coerce through i64" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  variant widths { small(u32), big(u64) }
+        \\  variant mix64 { dbl(f64), num(u64) }
+        \\  export pick: func(m: widths);
+        \\  export echo64: func(m: mix64) -> mix64;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // Lifting the u32 case out of the joined i64 slot wraps to the low
+    // 32 bits per the spec's CoerceValueIter.
+    try testing.expect(std.mem.indexOf(u8, src, "export fn pick(p0: i32, p1: i64) void") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".small = @as(u32, @bitCast(@as(i32, @truncate(p1))))") != null);
+    // f64 in an i64 slot round-trips via bit reinterpretation.
+    try testing.expect(std.mem.indexOf(u8, src, ".dbl = @as(f64, @bitCast(p1))") != null);
+}
+
+test "list of records lifts and lowers element-wise through the canonical layout" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  record rec { a: u8, b: u32 }
+        \\  import give: func(xs: list<rec>);
+        \\  export take: func(xs: list<rec>, ns: list<u32>) -> u32;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // The aggregate element must never be pointer-punned — Zig's
+    // automatic struct layout differs from the canonical layout.
+    try testing.expect(std.mem.indexOf(u8, src, "[*]const rec, @ptrFromInt") == null);
+    // Lift copies into a Zig array allocated from the realloc arena.
+    try testing.expect(std.mem.indexOf(u8, src, "@ptrCast(@alignCast(cabi_realloc(null, 0, @alignOf(rec)") != null);
+    // Lower stores each element into a canonical buffer.
+    try testing.expect(std.mem.indexOf(u8, src, "blk_ls_") != null);
+    // Scalar elements keep the zero-copy pun.
+    try testing.expect(std.mem.indexOf(u8, src, "@as([*]const u32, @ptrFromInt") != null);
+}
+
+test "exported resource emits the [dtor] destructor export" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\interface cache {
+        \\  resource entry {
+        \\    constructor();
+        \\  }
+        \\}
+        \\world w {
+        \\  export cache;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // wit-component only wires `[dtor]<res>` as the resource
+    // destructor; `[resource-drop]` is the import for dropping
+    // handles, never an export name.
+    try testing.expect(std.mem.indexOf(u8, src, "export fn @\"demo:x/cache@0.1.0#[dtor]entry\"") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "#[resource-drop]entry") == null);
+    // The constructor retires its task share inline (no post-return).
+    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.exitTask();\n    return _handle;") != null);
+}
+
+test "import wrappers lift single-flat small ints, char, and named types" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  record wrapper { x: u32 }
+        \\  variant plain { a, b }
+        \\  import geta: func() -> u8;
+        \\  import getb: func() -> s8;
+        \\  import getc: func() -> char;
+        \\  import loadw: func() -> wrapper;
+        \\  import loadp: func() -> plain;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, "return @as(u8, @truncate(@as(u32, @bitCast(p0))));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "return @as(i8, @truncate(p0));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "return abi.liftChar(@as(u32, @bitCast(p0)));") != null);
+    // Single-flat record: field-wise lift, not @enumFromInt garbage.
+    try testing.expect(std.mem.indexOf(u8, src, "return .{ .x = @as(u32, @bitCast(p0)) };") != null);
+    // Payload-less variant: discriminant switch with a trap arm.
+    try testing.expect(std.mem.indexOf(u8, src, "0 => .{ .a = {} }, 1 => .{ .b = {} }, else => abi.trap()") != null);
+}
+
+test "single-flat record and payload-less variant export results lower directly" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  record wrapper { x: u32 }
+        \\  variant plain { a, b }
+        \\  export getw: func() -> wrapper;
+        \\  export getp: func() -> plain;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, "return @as(i32, @bitCast(@as(u32, _result.x)));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "return @as(i32, switch (_result) { .a => 0, .b => 1, });") != null);
+}
+
+test "zero-flat empty-record results are constructed/discarded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  record empty {}
+        \\  import loade: func() -> empty;
+        \\  export gete: func() -> empty;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // The extern returns void; the wrapper constructs the empty value.
+    try testing.expect(std.mem.indexOf(u8, src, "return .{  };") != null);
+    // The export discards the result — nothing to lower.
+    try testing.expect(std.mem.indexOf(u8, src, "_ = _result;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "export fn gete() void") != null);
+}
+
+test "char and enum lifts validate through abi helpers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  enum color { red, green, blue }
+        \\  export shift: func(c: char) -> color;
+        \\  import back: func(c: char) -> color;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // Export param: char validated on the flat lift path.
+    try testing.expect(std.mem.indexOf(u8, src, "const c: u21 = abi.liftChar(@as(u32, @bitCast(p0)));") != null);
+    // Import result: enum discriminant validated against the case count.
+    try testing.expect(std.mem.indexOf(u8, src, "return abi.liftEnum(color, @as(u32, @bitCast(p0)));") != null);
+}
+
+test "sync exports pair enterTask with the post-return exitTask" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  export greet: func(name: string) -> string;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, "export fn greet(p0: i32, p1: i32) i32 {\n    realloc_state.enterTask();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.exitTask();\n}") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "realloc_state.reset()") == null);
 }
 
 test "canonical memory layout matches spec" {

@@ -121,8 +121,10 @@ examples/
                     `zig_wasi_components.wasi3` module: stream-based
                     stdio and file I/O, async clock sleeps, a
                     `stream<directory-entry>` listing, DNS — plus a
-                    compile-checked `wasi:http/service@0.3.0` guest
-                    driving the 0.3 http client wrappers.
+                    `wasi:http/service@0.3.0` guest that serves real
+                    requests under `wasmtime serve` and makes an
+                    outbound fetch through the 0.3 http client
+                    wrappers on each one.
 ```
 
 ## What works
@@ -137,7 +139,7 @@ The parser ingests the full WIT surface used by real WASI 0.2.x /
 - `resource` with constructors, methods, static methods,
   `own<T>` / `borrow<T>`
 - `stream<T>`, `future<T>`, `error-context`
-- `async` functions and named result tuples
+- `async` functions
 - `@since(version = ...)` / `@unstable(feature = ...)` /
   `@deprecated(version = ...)` gates
 - inline interfaces in world imports/exports
@@ -150,7 +152,9 @@ interface, and against the six final WASI `0.3.0` packages: every
 world in them generates bindings that compile, and components built
 from the generated `wasi:cli/command@0.3.0` and
 `wasi:http/service@0.3.0` bindings pass `wasm-tools component new`
-validation (the command world also runs under `wasmtime -S p3`).
+validation and run end to end under wasmtime 46+ (`wasmtime run
+-S p3` for the command world, `wasmtime serve -S p3,cli` for the
+http service, outbound requests included).
 The stream/future canon intrinsics are generated for *every*
 function that traffics in `stream<T>` / `future<T>` — async or sync,
 top-level or resource method — with canonical-layout `lift`/`lower`
@@ -218,6 +222,6 @@ either depend on upstream movement or have no shipping consumer yet.
   flags at 32 labels (`assert(0 < n <= 32)` in `CanonicalABI.md`).
   We follow the spec and return `error.Unsupported` past that
   boundary.
-- **Multi-named result tuples.** Modern `wasm-tools` rejects these
-  at embed time; the `@compileError` we emit for them is
-  unreachable in any working build.
+- **Multi-named result tuples.** Removed from WIT upstream; the
+  parser rejects `func() -> (a: u32, b: string)` just like modern
+  `wasm-tools` does. Use a `record` return type.

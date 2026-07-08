@@ -21,19 +21,17 @@ both are spec-legal alternatives.
 
 WIT historically allowed return types like
 `func() -> (a: u32, b: string)` — a tuple-like return where each
-element has a name. Modern `wasm-tools` rejects this at embed time,
-so the `@compileError` we emit when we see one is unreachable in
-any working build. The parser still accepts the syntax so older
-files round-trip, but a `record` return type is the only
-post-deprecation form you can actually ship.
+element has a name. The syntax has been removed from WIT and modern
+`wasm-tools` rejects it, so the parser now rejects it too, at parse
+time. A `record` return type is the modern equivalent.
 
 ## Multi-result returns on imports and resource methods
 
 `emitImportDecl` and `emitResourceExports` still emit
 `@compileError` for `func() -> (a: T1, b: T2, …)` style multi-
-result returns. Modern `wasm-tools` rejects these at embed time
-just like the multi-named tuple case, so the error path is
-unreachable in shipping builds. Use a `record` return type or a
+result returns, but the parser rejects the syntax before codegen
+ever sees it, matching modern `wasm-tools`. Use a `record` return
+type or a
 named single result.
 
 ## HTTP request bodies in the `wasi3` convenience module

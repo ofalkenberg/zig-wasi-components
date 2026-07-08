@@ -30,9 +30,6 @@ const ComponentSpec = struct {
 
 const Component = struct {
     file: std.Build.LazyPath,
-    /// The `wasm-tools component new` step — depend on this to get
-    /// validation without installing the artifact.
-    new_step: *std.Build.Step,
 };
 
 /// The standard pipeline for an example whose WIT is a single
@@ -81,7 +78,7 @@ fn addComponent(
     const new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
     new.addFileArg(embedded);
     const component = new.addPrefixedOutputFileArg("-o", b.fmt("{s}.component.wasm", .{spec.name}));
-    return .{ .file = component, .new_step = &new.step };
+    return .{ .file = component };
 }
 
 // Although this function looks imperative, it does not perform the build
@@ -554,10 +551,9 @@ pub fn build(b: *std.Build) void {
     // ----- wasi-demo-p3: the `wasi3` convenience module against WASI 0.3.0 -----
     // The main guest targets the real `wasi:cli/command@0.3.0` world
     // (wit/cli.wit is the final upstream package set, fully resolved).
-    // A second guest compiles the wasi3 http client wrappers against
-    // `wasi:http/service@0.3.0` and is validated by `component new`
-    // but not installed — no released runtime links the final
-    // wasi:http 0.3.0 interfaces yet.
+    // A second guest drives the wasi3 http client wrappers from a
+    // `wasi:http/service@0.3.0` handler; serve it with
+    // `wasmtime serve -S p3,cli -W component-model-async,component-model-more-async-builtins`.
     const p3 = addComponent(b, exe, mod, wasm_target, .{
         .name = "wasi-demo-p3",
         .root_source = "examples/wasi-demo-p3/component.zig",
@@ -572,10 +568,11 @@ pub fn build(b: *std.Build) void {
         .wit = "examples/wasi-demo-p3/wit-http/http.wit",
         .world = "service",
     });
+    const p3http_install = b.addInstallFile(p3http.file, "wasm/wasi-http-check.component.wasm");
 
     const p3_step = b.step("wasi-demo-p3", "Build the wasi3 (WASI 0.3.0) convenience-module demo");
     p3_step.dependOn(&p3_install.step);
-    p3_step.dependOn(p3http.new_step);
+    p3_step.dependOn(&p3http_install.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

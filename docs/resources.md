@@ -167,11 +167,10 @@ The hand-written wasi-http bindings in earlier revisions of the
 http-get example are now generated automatically, so resource-
 bearing host imports work in the common case, including tagged
 composite (`variant`, `option`, `result`) parameters and results.
-The one corner left is **multi-result returns** of the
-`func() -> (a: T1, b: T2)` form on resource methods: modern
-`wasm-tools` rejects those at embed time anyway, and the
-`@compileError` we emit for them is unreachable in shipping builds.
-Use a `record` return type or a single named result instead.
+The one corner left was **multi-result returns** of the
+`func() -> (a: T1, b: T2)` form on resource methods; the syntax has
+been removed from WIT and the parser now rejects it, matching
+modern `wasm-tools`. Use a `record` return type instead.
 
 Standalone async functions on world imports and exports are fully
 emitted — see `examples/async-basic/` for the end-to-end pattern.

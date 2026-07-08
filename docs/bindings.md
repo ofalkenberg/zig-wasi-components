@@ -237,10 +237,17 @@ pub const wit_exports = struct {
 
 If your export produces a `stream<T>` or `future<T>` and needs to
 keep the writable end alive until the host has drained it, register
-a cleanup closure with `abi.async_cleanup.schedule(set, fn)` from
-inside the function. The generated `[callback]` runs the closure
-when the waitable-set fires and re-evaluates `lift_outcome()` so the
-closure itself can chain another step.
+a cleanup closure with `abi.async_cleanup.schedule(set, fn, ctx)`
+from inside the function. The generated `[callback]` runs the
+closure when the waitable-set fires and re-evaluates
+`lift_outcome()` so the closure itself can chain another step.
+`ctx` is an opaque pointer handed back to the closure; because
+concurrent tasks can interleave inside one instance (e.g.
+simultaneous `wasmtime serve` requests), everything the cleanup
+touches must live behind `ctx` (typically a small heap allocation
+the closure frees), not in file-scope globals. See
+`examples/wasi-demo-p3/http-check.zig` for the pattern, including
+delivering a response-trailers future with `abi.FutureDelivery`.
 
 ### Typed state-machine form
 

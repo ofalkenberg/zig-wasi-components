@@ -181,20 +181,26 @@ Differences from the 0.2 wrapper worth knowing:
 
 `examples/wasi-demo-p3/` is a complete `wasi:cli/command@0.3.0`
 component exercising the module (`zig build wasi-demo-p3`; the step
-also compile-checks the http client wrappers against
-`wasi:http/service@0.3.0` and validates both with `wasm-tools
-component new`). Note that released runtimes still vendor the March
-2026 release candidate of WASI 0.3 — identical shapes, different
-version string — so components built against final `@0.3.0` will not
-link against wasmtime ≤ 47 yet. The demo was validated end-to-end
-under wasmtime 45/47 by rebuilding the identical guest against the
-rc-versioned WIT; once a runtime ships the final packages the
-installed demo runs as-is:
+also builds an http guest against `wasi:http/service@0.3.0` and
+validates both with `wasm-tools component new`). Wasmtime 46 and
+later ship the final WASI 0.3.0 interfaces, so the demo runs as-is:
 
 ```bash
 wasmtime run -S p3,inherit-network=y,allow-ip-name-lookup=y \
     -W component-model-async,component-model-more-async-builtins \
     --dir . --invoke 'run()' zig-out/wasm/wasi-demo-p3.component.wasm
+```
+
+The http guest (`examples/wasi-demo-p3/http-check.zig`) is a real
+service: it answers every request with a 200 whose headers report the
+result of an outbound `wasi3.http.fetch`, exercising the client
+wrappers and response construction in one round trip.
+
+```bash
+wasmtime serve -S p3,cli \
+    -W component-model-async,component-model-more-async-builtins \
+    zig-out/wasm/wasi-http-check.component.wasm
+curl -i http://127.0.0.1:8080/
 ```
 
 ## Path resolution

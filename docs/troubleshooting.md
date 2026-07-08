@@ -150,17 +150,19 @@ satisfied and the very first call traps.
 ### `instance export ... has the wrong type` / `function implementation is missing`
 
 On a WASI 0.3 component this is almost always a *version identity*
-mismatch, not an encoding bug. Released wasmtimes (up to and
-including 47) vendor the `0.3.0-rc-2026-03-15` interfaces — the
-shapes are identical to final 0.3.0, but named types such as
-`error-code` carry their interface's version in their type
-identity, so a component built against final `@0.3.0` fails to
-link every host function whose signature mentions one. Before
-suspecting your bindings, diff the version strings: fetch
-wasmtime's vendored WIT (`crates/wasi/src/p3/wit/deps/*.wit` in
-the wasmtime repo), regenerate bindings from it, and rebuild the
-otherwise-identical guest. Once a runtime ships the final
-packages, the original component links as-is.
+mismatch, not an encoding bug. Wasmtime 46 and later ship the
+final `0.3.0` interfaces, so components built against final
+`@0.3.0` link and run as-is (both `wasmtime run -S p3` and
+`wasmtime serve -S p3,cli`). Older wasmtimes (45 and earlier)
+vendor the `0.3.0-rc-2026-03-15` interfaces — the shapes are
+identical to final 0.3.0, but named types such as `error-code`
+carry their interface's version in their type identity, so a
+final-`@0.3.0` component fails to link every host function whose
+signature mentions one. Before suspecting your bindings, diff the
+version strings; on an old runtime you can fetch its vendored WIT
+(`crates/wasi/src/p3/wit/deps/*.wit` in the wasmtime repo),
+regenerate bindings from it, and rebuild the otherwise-identical
+guest.
 
 ### `synchronous future.read requires the component model more async builtins feature`
 

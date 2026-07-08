@@ -100,9 +100,27 @@ pub const Future = enum(u32) { _ };
 
 pub const Realloc = struct {
     arena: std.heap.ArenaAllocator,
+    /// Number of export tasks currently in flight. The arena backs
+    /// lifted parameters and import results of *every* task in the
+    /// instance, and component-model-async interleaves tasks — so a
+    /// finishing task may only reset the arena when it is the last
+    /// one out; otherwise the reset would free memory that suspended
+    /// tasks still reference.
+    live_tasks: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Realloc {
         return .{ .arena = .init(gpa) };
+    }
+
+    pub fn enterTask(self: *Realloc) void {
+        self.live_tasks += 1;
+    }
+
+    /// Mark one task done and reset the arena if it was the last one.
+    pub fn exitTask(self: *Realloc) void {
+        std.debug.assert(self.live_tasks > 0);
+        self.live_tasks -= 1;
+        if (self.live_tasks == 0) self.reset();
     }
 
     pub fn realloc(self: *Realloc, old_ptr: ?*anyopaque, old_size: usize, alignment: u32, new_size: usize) ?*anyopaque {
@@ -204,28 +222,35 @@ pub const root_async = if (is_wasm) struct {
 /// while a write is pending without tripping wasmtime's "cannot drop
 /// busy stream" guard.
 ///
-/// The user's export calls `abi.async_cleanup.schedule(<closure>)`
+/// The user's export calls `abi.async_cleanup.schedule(set, fn, ctx)`
 /// before returning. The generated `[async-lift]` then returns
-/// `CALLBACK_YIELD` (instead of `EXIT`) when this slot is non-empty,
-/// which causes the runtime to reschedule other tasks (the host's
-/// async reader drains the stream/future), then re-enters the
-/// `[callback]` export with `event = NONE`. The callback invokes
+/// `CALLBACK_YIELD` / `CALLBACK_WAIT` (instead of `EXIT`) when this
+/// task has a pending slot, which causes the runtime to reschedule
+/// other tasks (the host's async reader drains the stream/future),
+/// then re-enters the `[callback]` export. The callback invokes
 /// `abi.async_cleanup.run()`, which executes the scheduled closure
 /// — typically the `[stream-drop-writable-i]<fn>` /
 /// `[future-drop-writable-i]<fn>` call.
 ///
-/// Single-slot is fine because WebAssembly is single-threaded and
-/// each `[async-lift]` execution serialises on this slot. Multiple
-/// pending cleanups (e.g. an export that produces two streams)
-/// chain into a single closure.
+/// Concurrent tasks (e.g. simultaneous `wasmtime serve` requests
+/// into one instance) each own one slot, found again through the
+/// task-local `[context-get-0]` register; per-task state must travel
+/// through `ctx`, never through shared globals. Multiple pending
+/// cleanups within one task (an export producing two streams) chain
+/// into a single closure.
 pub const async_cleanup = struct {
-    pub const Fn = *const fn () void;
+    pub const Fn = *const fn (ctx: ?*anyopaque) void;
 
     pub const Pending = struct {
         /// Waitable-set handle to wait on before running cleanup, or 0
         /// to just yield once and run cleanup unconditionally.
         set: u32,
         cleanup: Fn,
+        /// Opaque per-task state handed back to `cleanup`. Concurrent
+        /// tasks each schedule their own slot, so anything the cleanup
+        /// touches must live here (or be otherwise task-owned), not in
+        /// shared globals.
+        ctx: ?*anyopaque,
     };
 
     /// Bounded array of pending-cleanup slots. Each in-flight async
@@ -248,10 +273,10 @@ pub const async_cleanup = struct {
     /// `async_cleanup` and `StateSlots` share the same one task-
     /// local register, so they cannot be mixed within a single
     /// `[async-lift]` invocation.
-    pub fn schedule(set: u32, cleanup: Fn) void {
+    pub fn schedule(set: u32, cleanup: Fn, ctx: ?*anyopaque) void {
         std.debug.assert(root_async.@"[context-get-0]"() == 0);
         for (&slots, 0..) |*s, i| if (s.* == null) {
-            s.* = .{ .set = set, .cleanup = cleanup };
+            s.* = .{ .set = set, .cleanup = cleanup, .ctx = ctx };
             root_async.@"[context-set-0]"(@intCast(i + 1));
             return;
         };
@@ -280,7 +305,7 @@ pub const async_cleanup = struct {
         const p = slots[idx - 1] orelse return false;
         slots[idx - 1] = null;
         root_async.@"[context-set-0]"(0);
-        p.cleanup();
+        p.cleanup(p.ctx);
         return true;
     }
 };
@@ -434,6 +459,27 @@ pub fn threadYield() bool {
     return root_async.@"[thread-yield]"() == 0;
 }
 
+/// Deterministic canonical-ABI trap (spec `trap()`) that survives all
+/// release modes; used for invalid discriminants, enum values, and
+/// char code points.
+pub fn trap() noreturn {
+    @trap();
+}
+
+/// Validate-and-lift a `char` per the spec's `convert_i32_to_char`:
+/// traps on surrogates and code points past the Unicode range.
+pub fn liftChar(v: u32) u21 {
+    if (v >= 0x110000 or (v >= 0xD800 and v < 0xE000)) trap();
+    return @intCast(v);
+}
+
+/// Validate-and-lift an enum discriminant, trapping out-of-range
+/// values instead of invoking undefined behavior.
+pub fn liftEnum(comptime E: type, v: u32) E {
+    if (v >= @typeInfo(E).@"enum".field_names.len) trap();
+    return @enumFromInt(v);
+}
+
 pub const StreamCopyError = error{
     StreamClosed,
     StreamFailed,
@@ -460,11 +506,20 @@ pub fn streamWriteAll(comptime ns: type, writable: Stream, data: []const ns.T) S
     }
 }
 
+pub const DrainResult = struct {
+    data: []u8,
+    /// True when the writer dropped its end — the stream end is now in
+    /// the DONE copy state and must not be read again (a further read
+    /// traps per the canonical ABI); false when `max_bytes` stopped
+    /// the drain first.
+    eof: bool,
+};
+
 /// Read bytes from a `stream<u8>` readable end until the writer drops
-/// its end (or `max_bytes` is reached). Reads land directly in the
-/// list's unused capacity, so the per-call read size grows with it.
-/// Caller owns the result.
-pub fn streamDrainBytes(comptime ns: type, gpa: std.mem.Allocator, readable: Stream, max_bytes: usize) (StreamCopyError || std.mem.Allocator.Error)![]u8 {
+/// its end (or `max_bytes` is reached), reporting which of the two
+/// ended the drain. Reads land directly in the list's unused capacity,
+/// so the per-call read size grows with it. Caller owns `data`.
+pub fn streamDrainBytesEof(comptime ns: type, gpa: std.mem.Allocator, readable: Stream, max_bytes: usize) (StreamCopyError || std.mem.Allocator.Error)!DrainResult {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     while (out.items.len < max_bytes) {
@@ -477,13 +532,112 @@ pub fn streamDrainBytes(comptime ns: type, gpa: std.mem.Allocator, readable: Str
                 out.items.len += d.progress;
                 switch (d.result) {
                     .completed => {},
-                    .dropped => return out.toOwnedSlice(gpa),
+                    .dropped => return .{ .data = try out.toOwnedSlice(gpa), .eof = true },
                     else => return error.StreamFailed,
                 }
             },
         }
     }
-    return out.toOwnedSlice(gpa);
+    return .{ .data = try out.toOwnedSlice(gpa), .eof = false };
+}
+
+/// `streamDrainBytesEof` for callers that don't reuse the stream end
+/// and so don't care which condition ended the drain.
+pub fn streamDrainBytes(comptime ns: type, gpa: std.mem.Allocator, readable: Stream, max_bytes: usize) (StreamCopyError || std.mem.Allocator.Error)![]u8 {
+    return (try streamDrainBytesEof(ns, gpa, readable, max_bytes)).data;
+}
+
+/// A parked one-shot write on a writable future end.
+///
+/// The canonical ABI requires a writable future end to reach the DONE
+/// copy state before `drop-writable` — the value must be delivered, or
+/// the reader must drop its end — and `cancel-write` traps unless a
+/// copy is in flight, so "cancel then drop" is never a valid disposal
+/// path. `start` parks an async write whose source buffer lives inside
+/// this struct so it survives until the copy resolves; `finish` reaps
+/// the completion event (blocking until the peer reads or drops) and
+/// then drops the writable end.
+///
+/// `start` must be called on the variable at its final address: the
+/// in-flight write captures `buf` by pointer, so the struct cannot be
+/// moved between `start` and `finish`.
+pub fn FutureDelivery(comptime ns: type) type {
+    const has_payload = @hasDecl(ns, "elem_size");
+    return struct {
+        writable: Future,
+        pending: bool,
+        disposed: bool,
+        buf: Buf align(buf_align),
+
+        const Buf = if (has_payload) [ns.elem_size]u8 else [0]u8;
+        const buf_align = if (has_payload) ns.elem_align else 1;
+
+        pub fn start(self: *@This(), writable: Future, value: ns.T) void {
+            self.writable = writable;
+            self.disposed = false;
+            if (comptime has_payload) ns.lower(value, @intFromPtr(&self.buf));
+            self.pending = switch (ns.writeRawAsync(writable, @intFromPtr(&self.buf))) {
+                .blocked => true,
+                .done => false,
+            };
+        }
+
+        /// Idempotent, as is `abandon`: a success path that has already
+        /// called one of them makes any later (errdefer'd) call a no-op.
+        pub fn finish(self: *@This()) void {
+            if (self.disposed) return;
+            self.disposed = true;
+            if (self.pending) {
+                const set = WaitableSet.init();
+                defer set.deinit();
+                set.join(@intFromEnum(self.writable));
+                while (true) {
+                    const n = set.wait();
+                    if (n.code == .future_write and n.p1 == @intFromEnum(self.writable)) break;
+                }
+                WaitableSet.leave(@intFromEnum(self.writable));
+                self.pending = false;
+            }
+            ns.dropWritable(self.writable);
+        }
+
+        /// Dispose without risking a block, for error paths where the
+        /// peer may never make progress. A write that already resolved
+        /// still gets its end dropped; an unresolved one is cancelled,
+        /// and if the cancel wins (result CANCELLED) the end is back in
+        /// IDLE where dropping traps — the handle is deliberately
+        /// leaked, the only spec-legal alternative to blocking.
+        pub fn abandon(self: *@This()) void {
+            if (self.disposed) return;
+            self.disposed = true;
+            if (self.pending) {
+                self.pending = false;
+                switch (ns.cancelWrite(self.writable)) {
+                    .blocked => unreachable,
+                    .done => |d| switch (d.result) {
+                        .completed, .dropped => {},
+                        else => return,
+                    },
+                }
+            }
+            ns.dropWritable(self.writable);
+        }
+
+        /// Dispose after the parked write's completion event has
+        /// already been consumed elsewhere — typically by the
+        /// `[callback]` wait of an `async_cleanup`-scheduled producer
+        /// that joined `writable` to its waitable set. Unregisters the
+        /// end from its set and drops it without waiting again.
+        pub fn reap(self: *@This()) void {
+            if (self.disposed) return;
+            self.disposed = true;
+            if (self.pending) {
+                self.pending = false;
+                WaitableSet.leave(@intFromEnum(self.writable));
+            }
+            ns.dropWritable(self.writable);
+        }
+    };
 }
 
 /// Block until the future resolves and return its payload lifted from

@@ -5,8 +5,8 @@
 //! cross-package `use` (`use foo:bar/baz@1.0.0.{x, y}`), resources with
 //! constructors / methods / statics / `borrow<T>` / `own<T>`, stream and
 //! future types, error-context, feature gates (`@since` / `@unstable` /
-//! `@deprecated`), `async` functions, named return tuples, and inline
-//! interface bodies inside world imports/exports.
+//! `@deprecated`), `async` functions, and inline interface bodies
+//! inside world imports/exports.
 //!
 //! This is a pure syntactic parser. It does not resolve type names
 //! across packages, but it preserves enough information that a later
@@ -26,14 +26,17 @@ pub const Error = error{
     UnexpectedToken,
     UnexpectedEof,
     InvalidVersion,
+    NestingTooDeep,
     OutOfMemory,
 };
 
 /// Result of parsing the optional version on a package id / use path.
+/// The numeric triple is strict semver (u64 parts, no leading zeros);
+/// pre-release / build suffixes are kept verbatim in `text`.
 pub const Version = struct {
-    major: u32,
-    minor: u32,
-    patch: u32,
+    major: u64,
+    minor: u64,
+    patch: u64,
     /// Raw text, including any pre-release / build suffix.
     text: []const u8,
 };
@@ -48,16 +51,23 @@ pub const PackagePath = struct {
     version: ?Version = null,
 };
 
-/// A "use" inside an interface or world: brings names into scope.
+/// A "use" statement. Inside an interface or world it brings names
+/// into scope (`use foo.{x, y as z};` — `items` is always non-null).
+/// At package level it binds an interface id (`use ns:pkg/i as j;` —
+/// `items` is null and `alias` holds the optional local name).
 pub const Use = struct {
     /// Path to the source interface. `interface` is required for
     /// item-level uses (`use foo.{x}`) — when the path is just a
     /// local identifier it appears as `interface` with empty
     /// namespace/name.
     path: PackagePath,
-    /// `null` items means `use foo;` — import everything by name.
-    /// Otherwise each entry is `(orig_name, optional_local_alias)`.
+    /// Non-null (possibly empty) for interface/world-scoped uses;
+    /// each entry is `(orig_name, optional_local_alias)`. Null for
+    /// package-level uses, which take no item list.
     items: ?[]const UseItem,
+    /// Local binding name for package-level `use <path> as <id>;`.
+    alias: ?[]const u8 = null,
+    gate: FeatureGate = .none,
 };
 
 pub const UseItem = struct {
@@ -65,11 +75,15 @@ pub const UseItem = struct {
     alias: ?[]const u8 = null,
 };
 
-pub const FeatureGate = union(enum) {
-    none,
-    since: Version,
-    unstable: []const u8,
-    deprecated: Version,
+/// Feature-gate annotations attached to a declaration. The spec allows
+/// them to combine (`@since` + `@deprecated` appears in real wasi WITs),
+/// so each kind is stored independently.
+pub const FeatureGate = struct {
+    since: ?Version = null,
+    unstable: ?[]const u8 = null,
+    deprecated: ?Version = null,
+
+    pub const none: FeatureGate = .{};
 };
 
 pub const TypeRef = struct {
@@ -263,6 +277,40 @@ pub const Package = struct {
 // Tokenizer
 // =====================================================================
 
+/// WIT identifiers are kebab-case: hyphen-separated words, each either
+/// `[a-z][a-z0-9]*` or `[A-Z][A-Z0-9]*` (a `%` escape prefix, stripped
+/// by the tokenizer, does not change the shape rule).
+fn isValidLabel(id: []const u8) bool {
+    var words = mem.splitScalar(u8, id, '-');
+    while (words.next()) |word| {
+        if (word.len == 0) return false;
+        const upper = ascii.isUpper(word[0]);
+        if (!upper and !ascii.isLower(word[0])) return false;
+        for (word[1..]) |c| {
+            if (ascii.isDigit(c)) continue;
+            if (upper and !ascii.isUpper(c)) return false;
+            if (!upper and !ascii.isLower(c)) return false;
+        }
+    }
+    return true;
+}
+
+/// Keywords that cannot appear unescaped where a type name is expected.
+/// Type-shaped keywords (`list`, `option`, primitives, …) are consumed
+/// by dedicated branches before the named-type fallback runs.
+fn isKeyword(id: []const u8) bool {
+    const keywords = [_][]const u8{
+        "package", "world",   "interface",   "import", "export",
+        "include", "use",     "as",          "with",   "type",
+        "record",  "variant", "enum",        "flags",  "resource",
+        "func",    "static",  "constructor", "async",
+    };
+    for (keywords) |kw| {
+        if (mem.eql(u8, id, kw)) return true;
+    }
+    return false;
+}
+
 const Tokenizer = struct {
     src: []const u8,
     pos: usize = 0,
@@ -298,17 +346,21 @@ const Tokenizer = struct {
                     continue;
                 }
                 if (c2 == '*') {
+                    // Block comments nest per the WIT spec.
                     self.pos += 2;
-                    while (self.pos + 1 < self.src.len and
-                        !(self.src[self.pos] == '*' and self.src[self.pos + 1] == '/'))
-                    {
-                        self.pos += 1;
+                    var depth: usize = 1;
+                    while (self.pos + 1 < self.src.len and depth > 0) {
+                        if (self.src[self.pos] == '/' and self.src[self.pos + 1] == '*') {
+                            depth += 1;
+                            self.pos += 2;
+                        } else if (self.src[self.pos] == '*' and self.src[self.pos + 1] == '/') {
+                            depth -= 1;
+                            self.pos += 2;
+                        } else {
+                            self.pos += 1;
+                        }
                     }
-                    if (self.pos + 1 < self.src.len) {
-                        self.pos += 2;
-                    } else {
-                        self.pos = self.src.len;
-                    }
+                    if (depth > 0) self.pos = self.src.len;
                     continue;
                 }
             }
@@ -338,15 +390,15 @@ const Tokenizer = struct {
                 self.pos += 1;
             } else break;
         }
-        if (self.pos == id_start) {
+        const id = self.src[id_start..self.pos];
+        if (id.len == 0 or !isValidLabel(id)) {
             self.pos = start;
             return null;
         }
-        return self.src[id_start..self.pos];
+        return id;
     }
 
-    /// Same as `nextIdent` but also requires that the identifier
-    /// doesn't start with a digit and isn't empty.
+    /// Same as `nextIdent` but the identifier is required.
     fn expectIdent(self: *Tokenizer) Error![]const u8 {
         const id = (try self.nextIdent()) orelse return Error.UnexpectedToken;
         return id;
@@ -396,12 +448,15 @@ const Parser = struct {
     pkg_namespace: []const u8 = "",
     pkg_name: []const u8 = "",
     pkg_version: ?Version = null,
+    type_depth: u32 = 0,
 
     worlds: std.ArrayList(World) = .empty,
     interfaces: std.ArrayList(Interface) = .empty,
     types: std.ArrayList(TypeDef) = .empty,
     uses: std.ArrayList(Use) = .empty,
     deps: std.ArrayList(Package) = .empty,
+
+    const max_type_depth = 512;
 
     fn parsePackage(self: *Parser) Error!Package {
         try self.tok.skipTrivia();
@@ -447,11 +502,15 @@ const Parser = struct {
             const docs = self.tok.takeDocs();
 
             if (try self.tok.consumeWord("package")) {
+                // Only block-form packages may follow the package
+                // header, and only at the top level (wasm-tools:
+                // "nested packages must be placed at the top-level").
+                if (expect_brace_close) return Error.UnexpectedToken;
                 try self.parseSubPackage();
                 continue;
             }
             if (try self.tok.consumeWord("use")) {
-                const u = try self.parseUseTail();
+                const u = try self.parseUseTail(.toplevel, gate);
                 try self.uses.append(self.gpa, u);
                 self.tok.clearDocs();
                 continue;
@@ -481,20 +540,8 @@ const Parser = struct {
         if (try self.tok.consume("@")) {
             version = try self.parseVersion();
         }
-        // Sub-packages may also be declared inline as `package X@v;`
-        // (rare but legal) — treat it as an empty package.
-        if (try self.tok.consume(";")) {
-            try self.deps.append(self.gpa, .{
-                .namespace = ns,
-                .name = name,
-                .version = version,
-                .worlds = &.{},
-                .interfaces = &.{},
-                .types = &.{},
-                .uses = &.{},
-            });
-            return;
-        }
+        // A second semicolon-form `package X@v;` is invalid: only one
+        // package header per file, further packages must be blocks.
         try self.tok.expect("{");
 
         const saved_worlds = self.worlds;
@@ -556,36 +603,27 @@ const Parser = struct {
         }
         const text = self.tok.src[start..self.tok.pos];
         if (text.len == 0) return Error.InvalidVersion;
-        // Parse strictly the leading "<u32>.<u32>.<u32>" and store the
-        // whole text (including pre-release / build metadata).
-        var nums: [3]u32 = .{ 0, 0, 0 };
+        var nums: [3]u64 = undefined;
         var idx: usize = 0;
-        var seg_start: usize = 0;
-        var seg_idx: usize = 0;
-        while (idx <= text.len) : (idx += 1) {
-            const at_end = idx == text.len;
-            const c = if (at_end) @as(u8, 0) else text[idx];
-            if (at_end or c == '.' or c == '-' or c == '+') {
-                if (seg_idx < 3 and idx > seg_start) {
-                    nums[seg_idx] = std.fmt.parseInt(u32, text[seg_start..idx], 10) catch {
-                        if (seg_idx == 0) return Error.InvalidVersion;
-                        // soft-fail for non-numeric pre-release tail
-                        break;
-                    };
-                    seg_idx += 1;
-                }
-                if (c == '-' or c == '+') break;
-                seg_start = idx + 1;
-                if (seg_idx >= 3) break;
+        for (&nums, 0..) |*num, seg| {
+            const seg_start = idx;
+            while (idx < text.len and ascii.isDigit(text[idx])) idx += 1;
+            const digits = text[seg_start..idx];
+            if (digits.len == 0) return Error.InvalidVersion;
+            if (digits.len > 1 and digits[0] == '0') return Error.InvalidVersion;
+            num.* = std.fmt.parseInt(u64, digits, 10) catch return Error.InvalidVersion;
+            if (seg < 2) {
+                if (idx >= text.len or text[idx] != '.') return Error.InvalidVersion;
+                idx += 1;
             }
         }
+        if (idx < text.len and text[idx] != '-' and text[idx] != '+') return Error.InvalidVersion;
         return .{ .major = nums[0], .minor = nums[1], .patch = nums[2], .text = text };
     }
 
     /// Parse a (possibly-zero) sequence of `@since(...)` / `@unstable(...)` /
-    /// `@deprecated(...)` annotations and return the most recent one
-    /// (only one is meaningful per item per the spec, but we tolerate
-    /// stacking and keep the last).
+    /// `@deprecated(...)` annotations. The kinds combine (`@since` +
+    /// `@deprecated` is common); a repeated kind keeps the last value.
     fn parseGate(self: *Parser) Error!FeatureGate {
         var out: FeatureGate = .none;
         while (true) {
@@ -596,16 +634,15 @@ const Parser = struct {
             if (mem.eql(u8, name, "since")) {
                 try self.tok.expectWord("version");
                 try self.tok.expect("=");
-                out = .{ .since = try self.parseVersion() };
+                out.since = try self.parseVersion();
             } else if (mem.eql(u8, name, "unstable")) {
                 try self.tok.expectWord("feature");
                 try self.tok.expect("=");
-                const feat = try self.tok.expectIdent();
-                out = .{ .unstable = feat };
+                out.unstable = try self.tok.expectIdent();
             } else if (mem.eql(u8, name, "deprecated")) {
                 try self.tok.expectWord("version");
                 try self.tok.expect("=");
-                out = .{ .deprecated = try self.parseVersion() };
+                out.deprecated = try self.parseVersion();
             } else {
                 // Skip the body of unknown annotations to keep moving.
                 var depth: usize = 1;
@@ -632,63 +669,72 @@ const Parser = struct {
         return false;
     }
 
-    fn parseUseTail(self: *Parser) Error!Use {
-        // `use foo;` | `use foo.{...};` | `use ns:pkg/iface[@ver][.{...}];`
-        const path = try self.parsePath(.allow_dot_items);
-        var items: ?[]const UseItem = null;
-        if (try self.tok.consume(".")) {
-            try self.tok.expect("{");
-            var list: std.ArrayList(UseItem) = .empty;
-            try self.tok.skipTrivia();
-            if (!try self.tok.consume("}")) {
-                while (true) {
-                    const orig = try self.tok.expectIdent();
-                    var alias: ?[]const u8 = null;
-                    if (try self.tok.consumeWord("as")) {
-                        alias = try self.tok.expectIdent();
-                    }
-                    try list.append(self.gpa, .{ .name = orig, .alias = alias });
-                    try self.tok.skipTrivia();
-                    if (try self.tok.consume(",")) {
-                        try self.tok.skipTrivia();
-                        if (try self.tok.consume("}")) break;
-                        continue;
-                    }
-                    try self.tok.expect("}");
-                    break;
-                }
+    const UseMode = enum {
+        /// Package level: `use <path> [as <id>];` — no item list.
+        toplevel,
+        /// Interface/world level: `use <path>.{a, b as c};` — the item
+        /// list is mandatory.
+        scoped,
+    };
+
+    fn parseUseTail(self: *Parser, mode: UseMode, gate: FeatureGate) Error!Use {
+        const path = try self.parsePath();
+        if (mode == .toplevel) {
+            var alias: ?[]const u8 = null;
+            if (try self.tok.consumeWord("as")) {
+                alias = try self.tok.expectIdent();
             }
-            items = try list.toOwnedSlice(self.gpa);
+            try self.tok.expect(";");
+            return .{ .path = path, .items = null, .alias = alias, .gate = gate };
         }
+        try self.tok.expect(".");
+        try self.tok.expect("{");
+        var list: std.ArrayList(UseItem) = .empty;
+        try self.tok.skipTrivia();
+        if (!try self.tok.consume("}")) {
+            while (true) {
+                const orig = try self.tok.expectIdent();
+                var alias: ?[]const u8 = null;
+                if (try self.tok.consumeWord("as")) {
+                    alias = try self.tok.expectIdent();
+                }
+                try list.append(self.gpa, .{ .name = orig, .alias = alias });
+                try self.tok.skipTrivia();
+                if (try self.tok.consume(",")) {
+                    try self.tok.skipTrivia();
+                    if (try self.tok.consume("}")) break;
+                    continue;
+                }
+                try self.tok.expect("}");
+                break;
+            }
+        }
+        const items = try list.toOwnedSlice(self.gpa);
         try self.tok.expect(";");
-        return .{ .path = path, .items = items };
+        return .{ .path = path, .items = items, .gate = gate };
     }
 
-    const PathMode = enum { full, allow_dot_items };
-
-    fn parsePath(self: *Parser, mode: PathMode) Error!PackagePath {
+    fn parsePath(self: *Parser) Error!PackagePath {
         // Either a bare identifier (sibling interface), or
         // `ns:pkg[/iface][@ver]`.
         const first = try self.tok.expectIdent();
         if (try self.tok.consume(":")) {
-            const pkg_name = try self.tok.expectIdent();
-            var iface: ?[]const u8 = null;
-            if (try self.tok.consume("/")) {
-                iface = try self.tok.expectIdent();
-            }
-            var ver: ?Version = null;
-            if (try self.tok.consume("@")) {
-                ver = try self.parseVersion();
-            }
-            _ = mode;
-            return .{
-                .namespace = first,
-                .name = pkg_name,
-                .interface = iface,
-                .version = ver,
-            };
+            return self.parsePathTail(first);
         }
         return .{ .namespace = "", .name = "", .interface = first };
+    }
+
+    /// Parse the `pkg[/iface][@ver]` remainder of a path whose
+    /// `ns:` prefix has already been consumed.
+    fn parsePathTail(self: *Parser, namespace: []const u8) Error!PackagePath {
+        var path: PackagePath = .{ .namespace = namespace, .name = try self.tok.expectIdent() };
+        if (try self.tok.consume("/")) {
+            path.interface = try self.tok.expectIdent();
+        }
+        if (try self.tok.consume("@")) {
+            path.version = try self.parseVersion();
+        }
+        return path;
     }
 
     fn parseWorld(self: *Parser, docs: []const u8, gate: FeatureGate) Error!void {
@@ -706,7 +752,7 @@ const Parser = struct {
             const inner_docs = self.tok.takeDocs();
 
             if (try self.tok.consumeWord("use")) {
-                const u = try self.parseUseTail();
+                const u = try self.parseUseTail(.scoped, inner_gate);
                 try uses.append(self.gpa, u);
                 continue;
             }
@@ -742,7 +788,7 @@ const Parser = struct {
     }
 
     fn parseIncludeTail(self: *Parser, gate: FeatureGate) Error!Include {
-        const path = try self.parsePath(.full);
+        const path = try self.parsePath();
         var renames: []const Include.Rename = &.{};
         if (try self.tok.consumeWord("with")) {
             try self.tok.expect("{");
@@ -775,42 +821,14 @@ const Parser = struct {
         //   <plain-path>;                        (e.g. `import sibling;` or `import ns:pkg/iface@ver;`)
         //   <name>: func(...) [-> T];
         //   <name>: interface { ... }
+        //   <name>: <target-path>;               (named reference, e.g. `import foo: bar;`)
         //   <name>: <type-expr>;
         //
-        // The first form may *contain* a `:`, so we have to peek ahead
-        // before assuming a stand-alone colon means "typed binding".
+        // The plain-path form also contains a `:`, so after the colon we
+        // look at what follows the next identifier: `/` or `@` continue
+        // the plain path, while `;` or `:` mean the identifier starts a
+        // named-reference target.
         const ident = try self.tok.expectIdent();
-        try self.tok.skipTrivia();
-        // Plain-path form: `ident:pkg/iface@ver;` — recognised by the
-        // `:` being immediately followed by an identifier and then `/`,
-        // `@`, or `;` (not by `func`, `interface`, `async`, or a type
-        // keyword).
-        if (self.tok.pos < self.tok.src.len and self.tok.src[self.tok.pos] == ':') {
-            const save = self.tok.pos;
-            self.tok.pos += 1;
-            const ahead = try self.tok.nextIdent();
-            const looks_like_path = blk: {
-                if (ahead == null) break :blk false;
-                try self.tok.skipTrivia();
-                if (self.tok.pos >= self.tok.src.len) break :blk false;
-                const c = self.tok.src[self.tok.pos];
-                break :blk (c == '/' or c == '@' or c == ';');
-            };
-            if (looks_like_path) {
-                var path: PackagePath = .{ .namespace = ident, .name = ahead.?, .interface = null };
-                if (try self.tok.consume("/")) path.interface = try self.tok.expectIdent();
-                if (try self.tok.consume("@")) path.version = try self.parseVersion();
-                try self.tok.expect(";");
-                return .{
-                    .kind = kind,
-                    .name = if (path.interface) |i| i else path.name,
-                    .body = .{ .plain = path },
-                    .docs = docs,
-                    .gate = gate,
-                };
-            }
-            self.tok.pos = save;
-        }
         if (try self.tok.consume(":")) {
             if (try self.tok.consumeWord("func")) {
                 const sig = try self.parseFuncTail(ident, false);
@@ -844,6 +862,41 @@ const Parser = struct {
                     .docs = docs,
                     .gate = gate,
                 };
+            }
+            const save = self.tok.pos;
+            if (try self.tok.nextIdent()) |_| {
+                try self.tok.skipTrivia();
+                const c = if (self.tok.pos < self.tok.src.len) self.tok.src[self.tok.pos] else 0;
+                switch (c) {
+                    ';', ':' => {
+                        // Named reference: the target is a path,
+                        // e.g. `import foo: bar;` or `import foo: ns:pkg/iface@ver;`.
+                        self.tok.pos = save;
+                        const path = try self.parsePath();
+                        try self.tok.expect(";");
+                        return .{
+                            .kind = kind,
+                            .name = ident,
+                            .body = .{ .plain = path },
+                            .docs = docs,
+                            .gate = gate,
+                        };
+                    },
+                    '/', '@' => {
+                        // `ident:…` was a plain path all along.
+                        self.tok.pos = save;
+                        const path = try self.parsePathTail(ident);
+                        try self.tok.expect(";");
+                        return .{
+                            .kind = kind,
+                            .name = if (path.interface) |i| i else path.name,
+                            .body = .{ .plain = path },
+                            .docs = docs,
+                            .gate = gate,
+                        };
+                    },
+                    else => self.tok.pos = save,
+                }
             }
             const ty = try self.parseTypeExpr();
             try self.tok.expect(";");
@@ -893,7 +946,7 @@ const Parser = struct {
             const member_docs = self.tok.takeDocs();
 
             if (try self.tok.consumeWord("use")) {
-                const u = try self.parseUseTail();
+                const u = try self.parseUseTail(.scoped, member_gate);
                 try uses.append(self.gpa, u);
                 continue;
             }
@@ -944,48 +997,14 @@ const Parser = struct {
         }
         var results: []const Param = &.{};
         if (try self.tok.consume("->")) {
-            results = try self.parseResultsTail();
+            // Named result tuples (`-> (a: T, b: T)`) were removed from
+            // WIT; the result is always a single type expression.
+            const ty = try self.parseTypeExpr();
+            const single = try self.gpa.alloc(Param, 1);
+            single[0] = .{ .name = "", .ty = ty };
+            results = single;
         }
         return .{ .name = name, .params = try params.toOwnedSlice(self.gpa), .results = results, .is_async = is_async };
-    }
-
-    /// Parse the value(s) after `->`. Either a single type expression or
-    /// a named-tuple `(name: T, name: T)`.
-    fn parseResultsTail(self: *Parser) Error![]const Param {
-        try self.tok.skipTrivia();
-        if (try self.tok.consume("(")) {
-            // could be a named-tuple result OR a tuple type expression
-            // wrapped in parens. WIT's grammar reserves `(x: T, y: T)`
-            // for named results.
-            // Detect by looking ahead for `ident :`.
-            const save = self.tok.pos;
-            const id = self.tok.nextIdent() catch null;
-            const sep_ok = id != null and (try self.tok.consume(":"));
-            if (sep_ok) {
-                var out: std.ArrayList(Param) = .empty;
-                const first_ty = try self.parseTypeExpr();
-                try out.append(self.gpa, .{ .name = id.?, .ty = first_ty });
-                while (true) {
-                    try self.tok.skipTrivia();
-                    if (try self.tok.consume(",")) {
-                        const n = try self.tok.expectIdent();
-                        try self.tok.expect(":");
-                        const t = try self.parseTypeExpr();
-                        try out.append(self.gpa, .{ .name = n, .ty = t });
-                        continue;
-                    }
-                    try self.tok.expect(")");
-                    break;
-                }
-                return try out.toOwnedSlice(self.gpa);
-            }
-            // Not named results — backtrack and parse as plain type expr.
-            self.tok.pos = save;
-        }
-        const ty = try self.parseTypeExpr();
-        const single = try self.gpa.alloc(Param, 1);
-        single[0] = .{ .name = "", .ty = ty };
-        return single;
     }
 
     fn parseTypeDef(self: *Parser, docs: []const u8, gate: FeatureGate) Error!TypeDef {
@@ -1041,11 +1060,13 @@ const Parser = struct {
                     break;
                 }
             }
+            if (cases.items.len == 0) return Error.UnexpectedToken;
             return .{ .name = name, .body = .{ .variant = try cases.toOwnedSlice(self.gpa) }, .docs = docs, .gate = gate };
         }
         if (try self.tok.consumeWord("enum")) {
             const name = try self.tok.expectIdent();
             const labels = try self.parseGatedLabelList();
+            if (labels.len == 0) return Error.UnexpectedToken;
             const out = try self.gpa.alloc(EnumCase, labels.len);
             for (labels, 0..) |l, i| out[i] = .{ .name = l.name, .docs = l.docs, .gate = l.gate };
             return .{ .name = name, .body = .{ .@"enum" = out }, .docs = docs, .gate = gate };
@@ -1133,6 +1154,9 @@ const Parser = struct {
     }
 
     fn parseTypeExpr(self: *Parser) Error!TypeRef {
+        if (self.type_depth >= max_type_depth) return Error.NestingTooDeep;
+        self.type_depth += 1;
+        defer self.type_depth -= 1;
         try self.tok.skipTrivia();
         if (try self.tok.consumeWord("list")) {
             try self.tok.expect("<");
@@ -1168,19 +1192,23 @@ const Parser = struct {
             }
             var ok_p: ?*const TypeRef = null;
             var err_p: ?*const TypeRef = null;
-            try self.tok.skipTrivia();
-            if (!try self.tok.consume("_")) {
-                const ok = try self.parseTypeExpr();
-                const box = try self.gpa.create(TypeRef);
-                box.* = ok;
-                ok_p = box;
-            }
-            try self.tok.skipTrivia();
-            if (try self.tok.consume(",")) {
+            if (try self.tok.consume("_")) {
+                try self.tok.expect(",");
                 const err = try self.parseTypeExpr();
                 const box = try self.gpa.create(TypeRef);
                 box.* = err;
                 err_p = box;
+            } else {
+                const ok = try self.parseTypeExpr();
+                const box = try self.gpa.create(TypeRef);
+                box.* = ok;
+                ok_p = box;
+                if (try self.tok.consume(",")) {
+                    const err = try self.parseTypeExpr();
+                    const err_box = try self.gpa.create(TypeRef);
+                    err_box.* = err;
+                    err_p = err_box;
+                }
             }
             try self.tok.expect(">");
             return .{ .kind = .{ .result = .{ .ok = ok_p, .err = err_p } } };
@@ -1255,7 +1283,10 @@ const Parser = struct {
             if (try self.tok.consumeWord(entry[0])) return .{ .kind = entry[1] };
         }
 
+        try self.tok.skipTrivia();
+        const escaped = self.tok.pos < self.tok.src.len and self.tok.src[self.tok.pos] == '%';
         const id = try self.tok.expectIdent();
+        if (!escaped and isKeyword(id)) return Error.UnexpectedToken;
         return .{ .kind = .{ .named = id } };
     }
 };
@@ -1356,7 +1387,7 @@ test "parse feature gates, includes, use, resources, async" {
 
     try testing.expectEqual(@as(usize, 1), pkg.interfaces.len);
     const iface = pkg.interfaces[0];
-    try testing.expect(iface.gate == .since);
+    try testing.expect(iface.gate.since != null);
     try testing.expectEqual(@as(usize, 1), iface.uses.len);
     try testing.expectEqualStrings("wasi", iface.uses[0].path.namespace);
     try testing.expectEqualStrings("io", iface.uses[0].path.name);
@@ -1368,7 +1399,7 @@ test "parse feature gates, includes, use, resources, async" {
     try testing.expect(members[0].kind == .constructor);
     try testing.expect(members[1].kind == .method);
     try testing.expect(members[2].kind == .static);
-    try testing.expect(members[2].gate == .unstable);
+    try testing.expect(members[2].gate.unstable != null);
     try testing.expect(members[2].func.params[0].ty.kind == .borrow);
 
     const w = pkg.worlds[0];
@@ -1384,7 +1415,7 @@ test "parse feature gates, includes, use, resources, async" {
     try testing.expectEqual(@as(usize, 1), w.externs[2].body.inline_interface.funcs.len);
 }
 
-test "parse stream / future / error-context / named results" {
+test "parse stream / future / error-context" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const pkg = try parse(arena.allocator(),
@@ -1392,16 +1423,261 @@ test "parse stream / future / error-context / named results" {
         \\interface i {
         \\  read-all: func(s: stream<u8>) -> future<list<u8>>;
         \\  ctx: func() -> error-context;
-        \\  pair: func() -> (lo: u32, hi: u32);
         \\  bare: func() -> stream;
         \\}
     );
     const iface = pkg.interfaces[0];
-    try testing.expectEqual(@as(usize, 4), iface.funcs.len);
+    try testing.expectEqual(@as(usize, 3), iface.funcs.len);
     try testing.expect(iface.funcs[0].params[0].ty.kind == .stream);
     try testing.expect(iface.funcs[0].results[0].ty.kind == .future);
     try testing.expect(iface.funcs[1].results[0].ty.kind == .error_context);
-    try testing.expectEqual(@as(usize, 2), iface.funcs[2].results.len);
-    try testing.expectEqualStrings("lo", iface.funcs[2].results[0].name);
-    try testing.expect(iface.funcs[3].results[0].ty.kind.stream == null);
+    try testing.expect(iface.funcs[2].results[0].ty.kind.stream == null);
+}
+
+test "named extern references keep the local name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface bar { f: func(); }
+        \\world w {
+        \\  import foo: bar;
+        \\  import baz: dep:pkg/thing@1.0.0;
+        \\  export dep:pkg/other;
+        \\}
+    );
+    const w = pkg.worlds[0];
+    try testing.expectEqual(@as(usize, 3), w.externs.len);
+
+    try testing.expectEqualStrings("foo", w.externs[0].name);
+    try testing.expectEqualStrings("bar", w.externs[0].body.plain.interface.?);
+    try testing.expectEqualStrings("", w.externs[0].body.plain.namespace);
+
+    try testing.expectEqualStrings("baz", w.externs[1].name);
+    try testing.expectEqualStrings("dep", w.externs[1].body.plain.namespace);
+    try testing.expectEqualStrings("pkg", w.externs[1].body.plain.name);
+    try testing.expectEqualStrings("thing", w.externs[1].body.plain.interface.?);
+    try testing.expect(w.externs[1].body.plain.version != null);
+
+    try testing.expectEqualStrings("other", w.externs[2].name);
+    try testing.expectEqualStrings("dep", w.externs[2].body.plain.namespace);
+}
+
+test "stacked feature gates all survive" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  @since(version = 0.2.0)
+        \\  @deprecated(version = 0.2.2)
+        \\  type field-key = string;
+        \\}
+    );
+    const gate = pkg.interfaces[0].types[0].gate;
+    try testing.expect(gate.since != null);
+    try testing.expect(gate.deprecated != null);
+    try testing.expectEqual(@as(u64, 0), gate.since.?.major);
+    try testing.expectEqual(@as(u64, 2), gate.since.?.minor);
+    try testing.expectEqual(@as(u64, 2), gate.deprecated.?.patch);
+}
+
+test "gates on use statements are kept" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface term { resource t; }
+        \\interface i {
+        \\  @since(version = 0.3.0)
+        \\  use term.{t};
+        \\}
+        \\world w {
+        \\  @unstable(feature = fancy)
+        \\  use term.{t as u};
+        \\  export f: func() -> u;
+        \\}
+    );
+    try testing.expect(pkg.interfaces[1].uses[0].gate.since != null);
+    try testing.expectEqualStrings("fancy", pkg.worlds[0].uses[0].gate.unstable.?);
+}
+
+test "second semicolon package and nested package blocks are rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func(); }
+        \\package c:d;
+        \\interface j { g: func(); }
+    ));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\package c:d@1.0.0 {
+        \\  package e:f@1.0.0 {
+        \\    interface j { g: func(); }
+        \\  }
+        \\}
+    ));
+    // The valid multi-package form still parses.
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func(); }
+        \\package c:d@1.0.0 {
+        \\  interface j { g: func(); }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), pkg.deps.len);
+    try testing.expectEqualStrings("d", pkg.deps[0].name);
+}
+
+test "strict semver versions" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const big = try parse(arena.allocator(), "package a:b@18446744073709551615.0.0;");
+    try testing.expectEqual(@as(u64, 18446744073709551615), big.version.?.major);
+    const rc = try parse(arena.allocator(), "package a:b@0.3.0-rc-2026-03-15;");
+    try testing.expectEqual(@as(u64, 3), rc.version.?.minor);
+    try testing.expectEqualStrings("0.3.0-rc-2026-03-15", rc.version.?.text);
+    try testing.expectError(Error.InvalidVersion, parse(arena.allocator(), "package a:b@1.2;"));
+    try testing.expectError(Error.InvalidVersion, parse(arena.allocator(), "package a:b@1.x.3;"));
+    try testing.expectError(Error.InvalidVersion, parse(arena.allocator(), "package a:b@01.0.0;"));
+}
+
+test "package-level use takes an alias, scoped use requires items" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\use dep:pkg/thing@1.0.0 as th;
+        \\use local-iface;
+        \\interface local-iface { f: func(); }
+    );
+    try testing.expectEqual(@as(usize, 2), pkg.uses.len);
+    try testing.expectEqualStrings("th", pkg.uses[0].alias.?);
+    try testing.expectEqualStrings("thing", pkg.uses[0].path.interface.?);
+    try testing.expect(pkg.uses[0].items == null);
+    try testing.expect(pkg.uses[1].alias == null);
+    // Item lists are not allowed at package level…
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface thing { type t = u32; }
+        \\use thing.{t};
+    ));
+    // …and are mandatory inside interfaces and worlds.
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface dep { type t = u32; }
+        \\interface i { use dep; }
+    ));
+}
+
+test "block comments nest" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\/* outer /* inner */ still a comment */
+        \\interface i { f: func(); }
+    );
+    try testing.expectEqual(@as(usize, 1), pkg.interfaces.len);
+}
+
+test "identifiers must be kebab-case" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { record foo_bar { x: u32 } }
+    ));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { record FooBar { x: u32 } }
+    ));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { record 9bad { x: u32 } }
+    ));
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  record foo-BAR { x: u32 }
+        \\  record WGPU-thing { y: u32 }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), pkg.interfaces[0].types.len);
+}
+
+test "keywords are rejected in type position unless escaped" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func(x: record) -> u32; }
+    ));
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func(x: %record) -> u32; }
+    );
+    try testing.expectEqualStrings("record", pkg.interfaces[0].funcs[0].params[0].ty.kind.named);
+}
+
+test "named result tuples are rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func() -> (lo: u32, hi: u32); }
+    ));
+}
+
+test "result<_> requires an error type" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func() -> result<_>; }
+    ));
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func() -> result<_, string>; }
+    );
+    const r = pkg.interfaces[0].funcs[0].results[0].ty.kind.result;
+    try testing.expect(r.ok == null and r.err != null);
+}
+
+test "empty enum and variant are rejected, empty record and flags allowed" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { enum e {} }
+    ));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { variant v {} }
+    ));
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  record r {}
+        \\  flags fl {}
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 0), pkg.interfaces[0].types[0].body.record.len);
+    try testing.expectEqual(@as(usize, 0), pkg.interfaces[0].types[1].body.flags.len);
+}
+
+test "type nesting depth is bounded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const depth = 600;
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(gpa, "package a:b;\ninterface i {\n  f: func() -> ");
+    for (0..depth) |_| try src.appendSlice(gpa, "option<");
+    try src.appendSlice(gpa, "u32");
+    for (0..depth) |_| try src.append(gpa, '>');
+    try src.appendSlice(gpa, ";\n}\n");
+    try testing.expectError(Error.NestingTooDeep, parse(gpa, src.items));
 }
