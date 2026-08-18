@@ -44,7 +44,7 @@ body stream is dropped, but the body can only be written while
 `client.send` is already in flight, so the two have to interleave.
 That requires the state-machine async export form (see
 [bindings.md](bindings.md)) rather than a plain blocking call. If
-you need a request body today, drive `wasi:http/types@0.3.0`
+you need a request body today, drive `wasi:http/types@0.3.1`
 through the generated bindings and their `intrinsics_*` namespaces
 directly from a state-machine export. The 0.2 module's
 `wasi.http.fetch` supports bodies as before.

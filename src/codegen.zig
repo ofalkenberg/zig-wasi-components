@@ -211,7 +211,7 @@ fn layoutOf(r: *Resolver, ty: wit.TypeRef) Error!Layout {
         .s32, .u32, .f32, .char => .{ .size = 4, .@"align" = 4 },
         .s64, .u64, .f64 => .{ .size = 8, .@"align" = 8 },
         .string => .{ .size = 8, .@"align" = 4 },
-        .list => .{ .size = 8, .@"align" = 4 },
+        .list, .map => .{ .size = 8, .@"align" = 4 },
         .list_fixed => |info| blk: {
             const inner = try layoutOf(r, info.elem.*);
             break :blk .{ .size = inner.size * info.len, .@"align" = inner.@"align" };
@@ -330,7 +330,7 @@ pub fn flattenType(out: *std.ArrayList(CoreType), gpa: Allocator, r: *Resolver, 
         .s64, .u64 => try out.append(gpa, .i64),
         .f32 => try out.append(gpa, .f32),
         .f64 => try out.append(gpa, .f64),
-        .string, .list => {
+        .string, .list, .map => {
             try out.append(gpa, .i32);
             try out.append(gpa, .i32);
         },
@@ -483,7 +483,7 @@ fn isPunnableListElem(r: *Resolver, ty: wit.TypeRef) bool {
         .char => false,
         .string => true,
         .own, .borrow, .stream, .future, .error_context => true,
-        .list => |inner| isPunnableListElem(r, inner.*),
+        .list, .map => |inner| isPunnableListElem(r, inner.*),
         .list_fixed => |info| isPunnableListElem(r, info.elem.*),
         .named => |nm| {
             const td = r.find(nm) orelse return false;
@@ -657,7 +657,7 @@ fn emitLowerImportSlots(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: 
             try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast({s}.len)));\n", .{ slot.* + 1, expr });
             slot.* += 2;
         },
-        .list => |inner| {
+        .list, .map => |inner| {
             try w.print("        const _p{d}: i32 = @bitCast(@as(u32, @intCast(", .{slot.*});
             try emitLowerListExpr(w, r, inner.*, expr);
             try w.writeAll(")));\n");
@@ -871,7 +871,7 @@ fn emitFlatSlotExpr(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []co
                 else => return Error.Unsupported,
             }
         },
-        .list => |inner| {
+        .list, .map => |inner| {
             switch (slot_idx) {
                 0 => {
                     try w.writeAll("@as(i32, @bitCast(@as(u32, @intCast(");
@@ -1157,7 +1157,9 @@ fn emitTypeRef(w: *std.Io.Writer, r: *Resolver, t: wit.TypeRef) Error!void {
         .char => try w.writeAll("u21"),
         .string => try w.writeAll("[]const u8"),
         .error_context => try w.writeAll("abi.ErrorContext"),
-        .list => |inner| {
+        // A map binds as a slice of key/value pairs, its canonical
+        // despecialization. Duplicate-key policy is the consumer's.
+        .list, .map => |inner| {
             try w.writeAll("[]const ");
             try emitTypeRef(w, r, inner.*);
         },
@@ -1313,7 +1315,7 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
         .string => {
             try w.print("@as([*]const u8, @ptrFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))[0..@as(*align(4) const u32, @ptrFromInt({s} + {d})).*]", .{ base, offset, base, offset + 4 });
         },
-        .list => |inner| {
+        .list, .map => |inner| {
             const ptr_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset });
             defer r.gpa.free(ptr_expr);
             const len_expr = try std.fmt.allocPrint(r.gpa, "@as(usize, @intCast(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset + 4 });
@@ -1473,7 +1475,7 @@ fn emitStoreMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []const 
             try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast(@intFromPtr({s}.ptr));\n", .{ base, offset, expr });
             try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast({s}.len);\n", .{ base, offset + 4, expr });
         },
-        .list => |inner| {
+        .list, .map => |inner| {
             try w.print("    @as(*align(4) u32, @ptrFromInt({s} + {d})).* = @intCast(", .{ base, offset });
             try emitLowerListExpr(w, r, inner.*, expr);
             try w.writeAll(");\n");
@@ -1705,7 +1707,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
             try w.writeAll("))))]");
             slot.* += 2;
         },
-        .list => |inner| {
+        .list, .map => |inner| {
             const p_slot = try slotAsAlloc(r.gpa, slots, slot.*, .i32);
             defer r.gpa.free(p_slot);
             const l_slot = try slotAsAlloc(r.gpa, slots, slot.* + 1, .i32);
@@ -2602,7 +2604,7 @@ fn collectStreamFuture(gpa: Allocator, r: *Resolver, out: *std.ArrayList(Payload
             });
             counter.* += 1;
         },
-        .list => |inner| try collectStreamFuture(gpa, r, out, inner.*, counter, visited),
+        .list, .map => |inner| try collectStreamFuture(gpa, r, out, inner.*, counter, visited),
         .list_fixed => |info| try collectStreamFuture(gpa, r, out, info.elem.*, counter, visited),
         .option => |inner| try collectStreamFuture(gpa, r, out, inner.*, counter, visited),
         .result => |info| {
@@ -2947,6 +2949,18 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         if (e.body == .inline_interface) {
             for (e.body.inline_interface.types) |t| try resolver.addWithPrefix(e.name, t);
         }
+        // A plain-named import (`import users: store;`) gets its own
+        // type namespace under the plain name. Two imports of the same
+        // interface then have distinct handle types, matching the
+        // instances being distinct. Named exports keep the canonical
+        // prefix instead.
+        if (e.named and e.kind == .import and e.body == .plain) {
+            const lookup = findInterface(&pkg, e.body.plain) orelse continue;
+            const ifp = try zigIfaceNameAlloc(gpa, e.name);
+            defer gpa.free(ifp);
+            for (lookup.iface.types) |t| try resolver.addWithPrefix(ifp, t);
+            try registerIfaceUses(&resolver, lookup.iface.uses, ifp, lookup.pkg.namespace, lookup.pkg.name, gpa);
+        }
     }
 
     // Register `use` items so they resolve as same-iface aliases when
@@ -2982,8 +2996,9 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
             },
             .plain => |p| {
                 const lookup = findInterface(&pkg, p) orelse continue;
+                const local = externLocalName(e, lookup);
                 for (lookup.iface.funcs) |f| {
-                    const prefix = try std.fmt.allocPrint(gpa, "{s}_{s}", .{ lookup.iface.name, f.name });
+                    const prefix = try std.fmt.allocPrint(gpa, "{s}_{s}", .{ local, f.name });
                     defer gpa.free(prefix);
                     try emitFuncAliases(w, &resolver, prefix, f);
                 }
@@ -2998,20 +3013,51 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
     // Loose (world-level) function imports stay inside `pub const
     // imports = struct {…};` for ergonomics.
     var world_level_func_imports: bool = false;
+    // Struct prefixes emitted so far, so the export pass knows which
+    // types-only structs are still missing. Owned strings.
+    var emitted_structs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (emitted_structs.items) |s| gpa.free(s);
+        emitted_structs.deinit(gpa);
+    }
     for (flat_world.externs) |e| {
         if (e.kind != .import) continue;
         switch (e.body) {
             .plain => |p| {
                 const lookup = findInterface(&pkg, p) orelse continue;
-                const wasm_iface = try fullInterfaceName(gpa, lookup.pkg.*, lookup.iface.name);
+                // A plain-named import binds under the plain name.
+                // That name is also its core-import module string.
+                const wasm_iface = try externModuleName(gpa, e, lookup);
                 defer gpa.free(wasm_iface);
                 try emitInterfaceImports(w, &resolver, lookup.iface.*, wasm_iface, lookup.pkg.namespace, lookup.pkg.name);
+                try emitted_structs.append(gpa, try zigIfaceNameAlloc(gpa, wasm_iface));
             },
-            .inline_interface => |iface| try emitInlineInterfaceImports(w, &resolver, e.name, iface),
+            .inline_interface => |iface| {
+                try emitInlineInterfaceImports(w, &resolver, e.name, iface);
+                try emitted_structs.append(gpa, try gpa.dupe(u8, e.name));
+            },
             .func => world_level_func_imports = true,
             .value => {},
         }
     }
+
+    // Export-only interfaces still need a struct: their thunks reach
+    // the types as `<prefix>.types.<name>`. Named exports resolve
+    // through the canonical prefix, so emit that one.
+    for (flat_world.externs) |e| {
+        if (e.kind != .@"export") continue;
+        switch (e.body) {
+            .plain => |p| {
+                const lookup = findInterface(&pkg, p) orelse continue;
+                const prefix = try ifacePrefixAlloc(gpa, lookup.pkg.*, lookup.iface.name);
+                defer gpa.free(prefix);
+                try maybeEmitTypesOnly(w, &resolver, &emitted_structs, prefix, lookup.pkg.namespace, lookup.pkg.name);
+            },
+            .inline_interface => try maybeEmitTypesOnly(w, &resolver, &emitted_structs, e.name, pkg.namespace, pkg.name),
+            else => {},
+        }
+    }
+
     if (world_level_func_imports) {
         try w.writeAll(
             \\/// Functions the host must provide (world-level imports).
@@ -3048,9 +3094,9 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
             .inline_interface => |iface| try emitInlineInterfaceExports(w, &resolver, e.name, e.name, iface),
             .plain => |p| {
                 const lookup = findInterface(&pkg, p) orelse continue;
-                const wasm_iface = try fullInterfaceName(gpa, lookup.pkg.*, lookup.iface.name);
+                const wasm_iface = try externModuleName(gpa, e, lookup);
                 defer gpa.free(wasm_iface);
-                try emitInterfaceExports(w, &resolver, lookup.iface.*, wasm_iface);
+                try emitInterfaceExports(w, &resolver, lookup.iface.*, wasm_iface, externLocalName(e, lookup));
             },
             .value => {},
         }
@@ -3060,17 +3106,14 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
     return list.toOwnedSlice(gpa);
 }
 
-fn emitInterfaceExports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, wasm_iface: []const u8) Error!void {
-    // Set the iface context so type refs in function signatures
-    // resolve through `types.<name>` / `<other>.types.<name>` rather
-    // than picking whatever iface the import loop left active.
-    var prefix_buf: std.Io.Writer.Allocating = .init(r.gpa);
-    defer prefix_buf.deinit();
-    emitZigIfaceName(&prefix_buf.writer, wasm_iface) catch unreachable;
+fn emitInterfaceExports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, wasm_iface: []const u8, local_name: []const u8) Error!void {
+    // Export thunks live at file scope, so type refs must be fully
+    // qualified. An empty iface context makes every named type
+    // resolve through its owning struct.
     const saved_prefix = r.current_iface_prefix;
     const saved_methods = r.methods_scope;
-    r.current_iface_prefix = prefix_buf.writer.buffered();
-    r.methods_scope = true;
+    r.current_iface_prefix = "";
+    r.methods_scope = false;
     defer {
         r.current_iface_prefix = saved_prefix;
         r.methods_scope = saved_methods;
@@ -3078,22 +3121,23 @@ fn emitInterfaceExports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, w
     for (iface.funcs) |f| {
         const prefixed = try std.fmt.allocPrint(r.gpa, "{s}#{s}", .{ wasm_iface, f.name });
         defer r.gpa.free(prefixed);
-        const dispatch = try std.fmt.allocPrint(r.gpa, "{s}.{s}", .{ iface.name, f.name });
+        const dispatch = try std.fmt.allocPrint(r.gpa, "{s}.{s}", .{ local_name, f.name });
         defer r.gpa.free(dispatch);
-        const alias = try std.fmt.allocPrint(r.gpa, "{s}_{s}", .{ iface.name, f.name });
+        const alias = try std.fmt.allocPrint(r.gpa, "{s}_{s}", .{ local_name, f.name });
         defer r.gpa.free(alias);
         try emitCabiExport(w, r, prefixed, dispatch, alias, f);
     }
     for (iface.types) |t| {
-        if (t.body == .resource) try emitResourceExports(w, r, iface.name, wasm_iface, t.name, t.body.resource);
+        if (t.body == .resource) try emitResourceExports(w, r, local_name, wasm_iface, t.name, t.body.resource);
     }
 }
 
 fn emitInlineInterfaceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const u8, wasm_iface: []const u8, iface: wit.InlineInterface) Error!void {
+    // Same file-scope rule as emitInterfaceExports: fully qualify.
     const saved_prefix = r.current_iface_prefix;
     const saved_methods = r.methods_scope;
-    r.current_iface_prefix = iface_zig_name;
-    r.methods_scope = true;
+    r.current_iface_prefix = "";
+    r.methods_scope = false;
     defer {
         r.current_iface_prefix = saved_prefix;
         r.methods_scope = saved_methods;
@@ -3110,6 +3154,76 @@ fn emitInlineInterfaceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: [
     for (iface.types) |t| {
         if (t.body == .resource) try emitResourceExports(w, r, iface_zig_name, wasm_iface, t.name, t.body.resource);
     }
+}
+
+/// The `pub const types = struct { ... };` block of an interface
+/// struct: `use` aliases, then the interface's own types. The nested
+/// sub-struct keeps method names from shadowing same-named types.
+fn emitIfaceTypesBlock(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8) Error!void {
+    try w.writeAll("    pub const types = struct {\n");
+    const saved_methods = r.methods_scope;
+    r.methods_scope = false;
+    defer r.methods_scope = saved_methods;
+    // Explicit `use` aliases: `pub const local = <other>.types.<orig>;`
+    for (r.entries.items) |entry| {
+        if (!entry.is_use_alias) continue;
+        if (!std.mem.eql(u8, entry.iface_prefix, this_prefix)) continue;
+        try w.writeAll("        pub const ");
+        try zigIdent(w, entry.td.name);
+        try w.writeAll(" = ");
+        try w.writeAll(entry.source_iface_prefix);
+        try w.writeAll(".types.");
+        try zigIdent(w, entry.source_name);
+        try w.writeAll(";\n");
+    }
+    for (r.entries.items) |entry| {
+        if (entry.is_use_alias) continue;
+        if (std.mem.eql(u8, entry.iface_prefix, this_prefix)) {
+            try emitTypeDecl(w, r, entry.td);
+        }
+    }
+    try w.writeAll("    };\n\n");
+}
+
+/// Emit a types-only struct for an exported interface, unless one
+/// already exists under `prefix` or the interface has no types.
+/// Appends the prefix to `emitted` when it writes something.
+fn maybeEmitTypesOnly(w: *std.Io.Writer, r: *Resolver, emitted: *std.ArrayList([]u8), prefix: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
+    for (emitted.items) |s| {
+        if (std.mem.eql(u8, s, prefix)) return;
+    }
+    var has_types = false;
+    for (r.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.iface_prefix, prefix)) {
+            has_types = true;
+            break;
+        }
+    }
+    if (!has_types) return;
+    try emitInterfaceTypesOnly(w, r, prefix, pkg_ns, pkg_name);
+    try emitted.append(r.gpa, try r.gpa.dupe(u8, prefix));
+}
+
+/// Struct holding only the types of an exported interface. Export
+/// thunks reference them as `<prefix>.types.<name>`, so the struct
+/// must exist even without import wrappers.
+fn emitInterfaceTypesOnly(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
+    try w.writeAll("pub const ");
+    try zigIdent(w, this_prefix);
+    try w.writeAll(" = struct {\n");
+    const saved_prefix = r.current_iface_prefix;
+    const saved_pkg_ns = r.current_pkg_namespace;
+    const saved_pkg_name = r.current_pkg_name;
+    r.current_iface_prefix = this_prefix;
+    r.current_pkg_namespace = pkg_ns;
+    r.current_pkg_name = pkg_name;
+    defer {
+        r.current_iface_prefix = saved_prefix;
+        r.current_pkg_namespace = saved_pkg_ns;
+        r.current_pkg_name = saved_pkg_name;
+    }
+    try emitIfaceTypesBlock(w, r, this_prefix);
+    try w.writeAll("};\n\n");
 }
 
 fn emitInterfaceImports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, wasm_iface: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
@@ -3134,34 +3248,7 @@ fn emitInterfaceImports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, w
         r.current_pkg_name = saved_pkg_name;
     }
 
-    // Types live in a nested `types` sub-struct so resource sub-structs
-    // and free functions can have method names that match type names
-    // without shadowing.
-    try w.writeAll("    pub const types = struct {\n");
-    {
-        const saved_methods = r.methods_scope;
-        r.methods_scope = false;
-        defer r.methods_scope = saved_methods;
-        // Explicit `use` aliases: `pub const local = <other>.types.<orig>;`
-        for (r.entries.items) |entry| {
-            if (!entry.is_use_alias) continue;
-            if (!std.mem.eql(u8, entry.iface_prefix, this_prefix)) continue;
-            try w.writeAll("        pub const ");
-            try zigIdent(w, entry.td.name);
-            try w.writeAll(" = ");
-            try w.writeAll(entry.source_iface_prefix);
-            try w.writeAll(".types.");
-            try zigIdent(w, entry.source_name);
-            try w.writeAll(";\n");
-        }
-        for (r.entries.items) |entry| {
-            if (entry.is_use_alias) continue;
-            if (std.mem.eql(u8, entry.iface_prefix, this_prefix)) {
-                try emitTypeDecl(w, r, entry.td);
-            }
-        }
-    }
-    try w.writeAll("    };\n\n");
+    try emitIfaceTypesBlock(w, r, this_prefix);
 
     // Methods + free funcs: same-iface type references prefix with
     // `types.` and cross-iface with `<other_iface>.types.<name>`.
@@ -3297,6 +3384,16 @@ fn emitZigIfaceName(w: *std.Io.Writer, wasm_iface: []const u8) Error!void {
     }
 }
 
+fn zigIfaceNameAlloc(gpa: Allocator, wasm_iface: []const u8) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    emitZigIfaceName(&aw.writer, wasm_iface) catch |e| switch (e) {
+        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+        else => unreachable,
+    };
+    return aw.toOwnedSlice();
+}
+
 /// Allocate the Zig identifier for an interface in a given package:
 /// `<ns>_<pkg>_<iface>` with kebab→snake. Used as the key for the
 /// resolver's iface_prefix tracking and as the top-level struct name
@@ -3323,17 +3420,7 @@ fn emitInlineInterfaceImports(w: *std.Io.Writer, r: *Resolver, name: []const u8,
     r.current_iface_prefix = name;
     defer r.current_iface_prefix = saved_prefix;
 
-    try w.writeAll("    pub const types = struct {\n");
-    {
-        const saved_methods = r.methods_scope;
-        r.methods_scope = false;
-        defer r.methods_scope = saved_methods;
-        for (r.entries.items) |entry| {
-            if (entry.is_use_alias) continue;
-            if (std.mem.eql(u8, entry.iface_prefix, name)) try emitTypeDecl(w, r, entry.td);
-        }
-    }
-    try w.writeAll("    };\n\n");
+    try emitIfaceTypesBlock(w, r, name);
 
     {
         const saved_methods = r.methods_scope;
@@ -3571,6 +3658,20 @@ const InterfaceLookup = struct {
     pkg: *const wit.Package,
     iface: *const wit.Interface,
 };
+
+/// Wasm-level instance name a plain extern binds under: the plain
+/// name for the named form, the full interface id otherwise. Caller
+/// frees.
+fn externModuleName(gpa: Allocator, e: wit.Extern, lookup: InterfaceLookup) Allocator.Error![]u8 {
+    if (e.named) return gpa.dupe(u8, e.name);
+    return fullInterfaceName(gpa, lookup.pkg.*, lookup.iface.name);
+}
+
+/// Zig-facing name of a plain extern: the binding name for the named
+/// form, the interface's own name otherwise.
+fn externLocalName(e: wit.Extern, lookup: InterfaceLookup) []const u8 {
+    return if (e.named) e.name else lookup.iface.name;
+}
 
 fn findInterface(pkg: *const wit.Package, path: wit.PackagePath) ?InterfaceLookup {
     const iface_name = path.interface orelse return null;
@@ -4613,6 +4714,103 @@ test "sync exports pair enterTask with the post-return exitTask" {
     try testing.expect(std.mem.indexOf(u8, src, "export fn greet(p0: i32, p1: i32) i32 {\n    realloc_state.enterTask();") != null);
     try testing.expect(std.mem.indexOf(u8, src, "realloc_state.exitTask();\n}") != null);
     try testing.expect(std.mem.indexOf(u8, src, "realloc_state.reset()") == null);
+}
+
+test "map codegen despecializes to list<tuple<K, V>>" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\world w {
+        \\  import feed: func(votes: map<string, u32>);
+        \\  export tally: func(votes: map<string, u32>) -> map<string, u32>;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, "votes: []const struct { []const u8, u32 }") != null);
+    // Pairs are not punnable, so both directions go element-wise with
+    // the canonical 12-byte stride of tuple<string, u32>.
+    try testing.expect(std.mem.indexOf(u8, src, "* 12") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".@\"0\".ptr") != null);
+    // The import lowers ptr+len like any list.
+    try testing.expect(std.mem.indexOf(u8, src, "@extern(*const fn (i32, i32) callconv(.c) void") != null);
+
+    // The map layout is the list layout.
+    var resolver: Resolver = .{ .gpa = testing.allocator };
+    defer resolver.deinit();
+    const pair = pkg.worlds[0].externs[1].body.func.params[0].ty.kind.map;
+    const l = try layoutOf(&resolver, .{ .kind = .{ .map = pair } });
+    try testing.expectEqual(@as(u32, 8), l.size);
+    try testing.expectEqual(@as(u32, 4), l.@"align");
+}
+
+test "plain-named interface imports bind under the plain name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\interface store {
+        \\  get: func(key: string) -> option<string>;
+        \\}
+        \\world w {
+        \\  @external-id("user-db-prod:region-a")
+        \\  import users: store;
+        \\  import catalog: store;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // Each import gets its own namespace, and the core import module
+    // is the plain name, not the full interface id.
+    try testing.expect(std.mem.indexOf(u8, src, "pub const users = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const catalog = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".library_name = \"users\"") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".library_name = \"catalog\"") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "demo:x/store") == null);
+}
+
+test "plain-named interface exports bind under the plain name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\interface store {
+        \\  get: func(key: string) -> option<string>;
+        \\}
+        \\world w {
+        \\  export handler: store;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    // Export names and the user-facing dispatch both use the plain name.
+    try testing.expect(std.mem.indexOf(u8, src, "export fn @\"handler#get\"") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "exports.handler.get") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "demo:x/store") == null);
+}
+
+test "export-only interfaces get a types struct and qualified refs" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\interface geo {
+        \\  record point { x: s32, y: s32 }
+        \\  dist: func(p: point) -> u32;
+        \\}
+        \\world w1 { export geo; }
+        \\world w2 { export mapper: geo; }
+    );
+    for (pkg.worlds) |wld| {
+        const src = try generateWorld(testing.allocator, pkg, wld, .{});
+        defer testing.allocator.free(src);
+        // The interface is not imported, so the thunks need a
+        // types-only struct and fully qualified refs.
+        try testing.expect(std.mem.indexOf(u8, src, "pub const demo_x_geo = struct {") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "demo_x_geo.types.point") != null);
+        try testing.expect(std.mem.indexOf(u8, src, " types.point") == null);
+    }
 }
 
 test "canonical memory layout matches spec" {

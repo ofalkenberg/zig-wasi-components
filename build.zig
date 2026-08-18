@@ -548,12 +548,14 @@ pub fn build(b: *std.Build) void {
     const stream_step = b.step("stream-demo", "Build the typed stream<T> demo component");
     stream_step.dependOn(&stream_install.step);
 
-    // ----- wasi-demo-p3: the `wasi3` convenience module against WASI 0.3.0 -----
-    // The main guest targets the real `wasi:cli/command@0.3.0` world
+    // ----- wasi-demo-p3: the `wasi3` convenience module against WASI 0.3.1 -----
+    // The main guest targets the real `wasi:cli/command@0.3.1` world
     // (wit/cli.wit is the final upstream package set, fully resolved).
     // A second guest drives the wasi3 http client wrappers from a
-    // `wasi:http/service@0.3.0` handler; serve it with
+    // `wasi:http/service@0.3.1` handler; serve it with
     // `wasmtime serve -S p3,cli -W component-model-async,component-model-more-async-builtins`.
+    // Wasmtime implements the 0.3.0 interfaces and links the 0.3.1
+    // imports through semver-compatible resolution.
     const p3 = addComponent(b, exe, mod, wasm_target, .{
         .name = "wasi-demo-p3",
         .root_source = "examples/wasi-demo-p3/component.zig",
@@ -570,7 +572,7 @@ pub fn build(b: *std.Build) void {
     });
     const p3http_install = b.addInstallFile(p3http.file, "wasm/wasi-http-check.component.wasm");
 
-    const p3_step = b.step("wasi-demo-p3", "Build the wasi3 (WASI 0.3.0) convenience-module demo");
+    const p3_step = b.step("wasi-demo-p3", "Build the wasi3 (WASI 0.3.1) convenience-module demo");
     p3_step.dependOn(&p3_install.step);
     p3_step.dependOn(&p3http_install.step);
 

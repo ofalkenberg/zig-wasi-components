@@ -1,4 +1,4 @@
-package wasi:cli@0.3.0;
+package wasi:cli@0.3.1;
 
 @since(version = 0.3.0)
 interface environment {
@@ -201,18 +201,18 @@ world imports {
   import terminal-stdout;
   @since(version = 0.3.0)
   import terminal-stderr;
-  import wasi:clocks/types@0.3.0;
-  import wasi:clocks/monotonic-clock@0.3.0;
-  import wasi:clocks/system-clock@0.3.0;
+  import wasi:clocks/types@0.3.1;
+  import wasi:clocks/monotonic-clock@0.3.1;
+  import wasi:clocks/system-clock@0.3.1;
   @unstable(feature = clocks-timezone)
-  import wasi:clocks/timezone@0.3.0;
-  import wasi:filesystem/types@0.3.0;
-  import wasi:filesystem/preopens@0.3.0;
-  import wasi:sockets/types@0.3.0;
-  import wasi:sockets/ip-name-lookup@0.3.0;
-  import wasi:random/random@0.3.0;
-  import wasi:random/insecure@0.3.0;
-  import wasi:random/insecure-seed@0.3.0;
+  import wasi:clocks/timezone@0.3.1;
+  import wasi:filesystem/types@0.3.1;
+  import wasi:filesystem/preopens@0.3.1;
+  import wasi:sockets/types@0.3.1;
+  import wasi:sockets/ip-name-lookup@0.3.1;
+  import wasi:random/random@0.3.1;
+  import wasi:random/insecure@0.3.1;
+  import wasi:random/insecure-seed@0.3.1;
 }
 @since(version = 0.3.0)
 world command {
@@ -238,23 +238,23 @@ world command {
   import terminal-stdout;
   @since(version = 0.3.0)
   import terminal-stderr;
-  import wasi:clocks/types@0.3.0;
-  import wasi:clocks/monotonic-clock@0.3.0;
-  import wasi:clocks/system-clock@0.3.0;
+  import wasi:clocks/types@0.3.1;
+  import wasi:clocks/monotonic-clock@0.3.1;
+  import wasi:clocks/system-clock@0.3.1;
   @unstable(feature = clocks-timezone)
-  import wasi:clocks/timezone@0.3.0;
-  import wasi:filesystem/types@0.3.0;
-  import wasi:filesystem/preopens@0.3.0;
-  import wasi:sockets/types@0.3.0;
-  import wasi:sockets/ip-name-lookup@0.3.0;
-  import wasi:random/random@0.3.0;
-  import wasi:random/insecure@0.3.0;
-  import wasi:random/insecure-seed@0.3.0;
+  import wasi:clocks/timezone@0.3.1;
+  import wasi:filesystem/types@0.3.1;
+  import wasi:filesystem/preopens@0.3.1;
+  import wasi:sockets/types@0.3.1;
+  import wasi:sockets/ip-name-lookup@0.3.1;
+  import wasi:random/random@0.3.1;
+  import wasi:random/insecure@0.3.1;
+  import wasi:random/insecure-seed@0.3.1;
 
   @since(version = 0.3.0)
   export run;
 }
-package wasi:clocks@0.3.0 {
+package wasi:clocks@0.3.1 {
   interface types {
     type duration = u64;
   }
@@ -295,9 +295,9 @@ package wasi:clocks@0.3.0 {
 }
 
 
-package wasi:filesystem@0.3.0 {
+package wasi:filesystem@0.3.1 {
   interface types {
-    use wasi:clocks/system-clock@0.3.0.{instant};
+    use wasi:clocks/system-clock@0.3.1.{instant};
 
     type filesize = u64;
 
@@ -444,9 +444,9 @@ package wasi:filesystem@0.3.0 {
 }
 
 
-package wasi:sockets@0.3.0 {
+package wasi:sockets@0.3.1 {
   interface types {
-    use wasi:clocks/types@0.3.0.{duration};
+    use wasi:clocks/types@0.3.1.{duration};
 
     variant error-code {
       access-denied,
@@ -560,7 +560,7 @@ package wasi:sockets@0.3.0 {
 }
 
 
-package wasi:random@0.3.0 {
+package wasi:random@0.3.1 {
   interface random {
     get-random-bytes: func(max-len: u64) -> list<u8>;
 

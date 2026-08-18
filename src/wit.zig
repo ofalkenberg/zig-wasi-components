@@ -6,7 +6,9 @@
 //! constructors / methods / statics / `borrow<T>` / `own<T>`, stream and
 //! future types, error-context, feature gates (`@since` / `@unstable` /
 //! `@deprecated`), `async` functions, and inline interface bodies
-//! inside world imports/exports.
+//! inside world imports/exports. The WASI 0.3.1 additions are in too:
+//! `map<K, V>`, `@external-id("...")` annotations, and plain-named
+//! interface imports/exports (`import users: store;`).
 //!
 //! This is a pure syntactic parser. It does not resolve type names
 //! across packages, but it preserves enough information that a later
@@ -75,13 +77,14 @@ pub const UseItem = struct {
     alias: ?[]const u8 = null,
 };
 
-/// Feature-gate annotations attached to a declaration. The spec allows
-/// them to combine (`@since` + `@deprecated` appears in real wasi WITs),
-/// so each kind is stored independently.
+/// Annotations attached to a declaration. Feature gates may combine,
+/// so each kind is stored independently. `@external-id` (WASI 0.3.1)
+/// rides along because it shares the annotation position.
 pub const FeatureGate = struct {
     since: ?Version = null,
     unstable: ?[]const u8 = null,
     deprecated: ?Version = null,
+    external_id: ?[]const u8 = null,
 
     pub const none: FeatureGate = .{};
 };
@@ -115,6 +118,10 @@ pub const TypeRef = struct {
         // handles -------------------------------------------------------
         own: []const u8, // resource name
         borrow: []const u8, // resource name
+        /// `map<K, V>` (WASI 0.3.1). The payload is the element as a
+        /// `tuple<K, V>`, so ABI code treats the whole thing like
+        /// `list<tuple<K, V>>` — its canonical despecialization.
+        map: *const TypeRef,
         // async types ---------------------------------------------------
         stream: ?*const TypeRef,
         future: ?*const TypeRef,
@@ -222,6 +229,10 @@ pub const Extern = struct {
     /// extracted from the path when applicable).
     name: []const u8,
     body: ExternBody,
+    /// True for the plain-named form `import users: store;` (WASI
+    /// 0.3.1). The extern then binds under `name` instead of the full
+    /// interface id.
+    named: bool = false,
     docs: []const u8 = "",
     gate: FeatureGate = .none,
 };
@@ -433,6 +444,68 @@ const Tokenizer = struct {
         if (!try self.consume(lit)) return Error.UnexpectedToken;
     }
 
+    /// A double-quoted string literal, as used by `@external-id`.
+    /// Core Wasm text-format escapes are decoded.
+    fn expectString(self: *Tokenizer) Error![]const u8 {
+        try self.skipTrivia();
+        if (self.pos >= self.src.len or self.src[self.pos] != '"') return Error.UnexpectedToken;
+        self.pos += 1;
+        const start = self.pos;
+        var decoded: ?std.ArrayList(u8) = null;
+        errdefer if (decoded) |*d| d.deinit(self.gpa);
+        while (self.pos < self.src.len) {
+            const c = self.src[self.pos];
+            if (c == '"') {
+                self.pos += 1;
+                if (decoded) |*d| return try d.toOwnedSlice(self.gpa);
+                return self.src[start .. self.pos - 1];
+            }
+            if (c != '\\') {
+                // Control characters must be escaped per the grammar.
+                if (c < 0x20 or c == 0x7f) return Error.UnexpectedToken;
+                if (decoded) |*d| try d.append(self.gpa, c);
+                self.pos += 1;
+                continue;
+            }
+            if (decoded == null) {
+                decoded = .empty;
+                try decoded.?.appendSlice(self.gpa, self.src[start..self.pos]);
+            }
+            const d = &decoded.?;
+            self.pos += 1;
+            if (self.pos >= self.src.len) return Error.UnexpectedEof;
+            const esc = self.src[self.pos];
+            self.pos += 1;
+            switch (esc) {
+                't' => try d.append(self.gpa, '\t'),
+                'n' => try d.append(self.gpa, '\n'),
+                'r' => try d.append(self.gpa, '\r'),
+                '"', '\'', '\\' => try d.append(self.gpa, esc),
+                'u' => {
+                    if (self.pos >= self.src.len or self.src[self.pos] != '{') return Error.UnexpectedToken;
+                    self.pos += 1;
+                    const hex_start = self.pos;
+                    while (self.pos < self.src.len and self.src[self.pos] != '}') self.pos += 1;
+                    if (self.pos >= self.src.len) return Error.UnexpectedEof;
+                    const cp = std.fmt.parseInt(u21, self.src[hex_start..self.pos], 16) catch return Error.UnexpectedToken;
+                    self.pos += 1;
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch return Error.UnexpectedToken;
+                    try d.appendSlice(self.gpa, buf[0..n]);
+                },
+                else => {
+                    // Raw byte escape `\hh`.
+                    if (self.pos >= self.src.len) return Error.UnexpectedEof;
+                    const hi = std.fmt.charToDigit(esc, 16) catch return Error.UnexpectedToken;
+                    const lo = std.fmt.charToDigit(self.src[self.pos], 16) catch return Error.UnexpectedToken;
+                    self.pos += 1;
+                    try d.append(self.gpa, hi * 16 + lo);
+                },
+            }
+        }
+        return Error.UnexpectedEof;
+    }
+
     fn expectWord(self: *Tokenizer, lit: []const u8) Error!void {
         if (!try self.consumeWord(lit)) return Error.UnexpectedToken;
     }
@@ -441,6 +514,15 @@ const Tokenizer = struct {
 // =====================================================================
 // Parser
 // =====================================================================
+
+/// The `kt` production: map keys are limited to integers, `char`,
+/// `bool` and `string`.
+fn isValidMapKey(kind: TypeRef.Kind) bool {
+    return switch (kind) {
+        .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .char, .string => true,
+        else => false,
+    };
+}
 
 const Parser = struct {
     gpa: Allocator,
@@ -643,6 +725,8 @@ const Parser = struct {
                 try self.tok.expectWord("version");
                 try self.tok.expect("=");
                 out.deprecated = try self.parseVersion();
+            } else if (mem.eql(u8, name, "external-id")) {
+                out.external_id = try self.tok.expectString();
             } else {
                 // Skip the body of unknown annotations to keep moving.
                 var depth: usize = 1;
@@ -811,8 +895,12 @@ const Parser = struct {
                 }
             }
             renames = try rl.toOwnedSlice(self.gpa);
+            // The with-form ends at its closing brace. A stray
+            // semicolon is tolerated for older files.
+            _ = try self.tok.consume(";");
+        } else {
+            try self.tok.expect(";");
         }
-        try self.tok.expect(";");
         return .{ .path = path, .renames = renames, .gate = gate };
     }
 
@@ -878,6 +966,7 @@ const Parser = struct {
                             .kind = kind,
                             .name = ident,
                             .body = .{ .plain = path },
+                            .named = true,
                             .docs = docs,
                             .gate = gate,
                         };
@@ -1226,6 +1315,20 @@ const Parser = struct {
             }
             return .{ .kind = .{ .tuple = try elems.toOwnedSlice(self.gpa) } };
         }
+        if (try self.tok.consumeWord("map")) {
+            try self.tok.expect("<");
+            const key = try self.parseTypeExpr();
+            if (!isValidMapKey(key.kind)) return Error.UnexpectedToken;
+            try self.tok.expect(",");
+            const value = try self.parseTypeExpr();
+            try self.tok.expect(">");
+            const pair = try self.gpa.alloc(TypeRef, 2);
+            pair[0] = key;
+            pair[1] = value;
+            const elem = try self.gpa.create(TypeRef);
+            elem.* = .{ .kind = .{ .tuple = pair } };
+            return .{ .kind = .{ .map = elem } };
+        }
         if (try self.tok.consumeWord("own")) {
             try self.tok.expect("<");
             const id = try self.tok.expectIdent();
@@ -1432,6 +1535,129 @@ test "parse stream / future / error-context" {
     try testing.expect(iface.funcs[0].results[0].ty.kind == .future);
     try testing.expect(iface.funcs[1].results[0].ty.kind == .error_context);
     try testing.expect(iface.funcs[2].results[0].ty.kind.stream == null);
+}
+
+test "parse map type" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package demo:maps@0.3.1;
+        \\interface i {
+        \\  tally: func(votes: map<string, u32>) -> map<string, list<u8>>;
+        \\}
+    );
+    const f = pkg.interfaces[0].funcs[0];
+    const param = f.params[0].ty.kind.map;
+    try testing.expect(param.kind.tuple.len == 2);
+    try testing.expect(param.kind.tuple[0].kind == .string);
+    try testing.expect(param.kind.tuple[1].kind == .u32);
+    const res = f.results[0].ty.kind.map;
+    try testing.expect(res.kind.tuple[1].kind == .list);
+}
+
+test "map keys are restricted to the kt production" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Floats and named types cannot key a map.
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { f: func() -> map<f32, u32>; }
+    ));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\interface i { type k = u32; f: func() -> map<k, u32>; }
+    ));
+    // All kt members parse.
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  f: func() -> map<bool, u32>;
+        \\  g: func() -> map<s64, u32>;
+        \\  h: func() -> map<char, u32>;
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), pkg.interfaces[0].funcs.len);
+}
+
+test "external-id annotations are captured" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface store { get: func(key: string) -> option<string>; }
+        \\interface my-interface {
+        \\  @external-id("foo/0")
+        \\  foo: func() -> string;
+        \\  @external-id("DB.Bar")
+        \\  resource bar {
+        \\    @external-id("baz/1")
+        \\    baz: func(s: string) -> string;
+        \\  }
+        \\}
+        \\world w {
+        \\  @external-id("user-db-prod:region-a")
+        \\  import users: store;
+        \\  import catalog: store;
+        \\}
+    );
+    const iface = pkg.interfaces[1];
+    try testing.expectEqualStrings("foo/0", iface.funcs[0].gate.external_id.?);
+    try testing.expectEqualStrings("DB.Bar", iface.types[0].gate.external_id.?);
+    try testing.expectEqualStrings("baz/1", iface.types[0].body.resource[0].gate.external_id.?);
+    const w = pkg.worlds[0];
+    try testing.expectEqualStrings("user-db-prod:region-a", w.externs[0].gate.external_id.?);
+    try testing.expect(w.externs[0].named);
+    try testing.expect(w.externs[1].gate.external_id == null);
+    try testing.expect(w.externs[1].named);
+}
+
+test "include with-form takes no trailing semicolon" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface store { get: func() -> string; }
+        \\world base { import cache: store; }
+        \\world extended {
+        \\  include base with { cache as my-cache }
+        \\  export f: func();
+        \\}
+    );
+    const w = pkg.worlds[1];
+    try testing.expectEqual(@as(usize, 1), w.includes.len);
+    try testing.expectEqualStrings("my-cache", w.includes[0].renames[0].to);
+    // The plain form still requires its semicolon.
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\world base { import f: func(); }
+        \\world extended {
+        \\  include base
+        \\  export g: func();
+        \\}
+    ));
+}
+
+test "external-id string escapes decode" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\world w {
+        \\  @external-id("a\22b\u{e9}c\\d\n")
+        \\  import f: func();
+        \\  @external-id("plain")
+        \\  import g: func();
+        \\}
+    );
+    try testing.expectEqualStrings("a\"b\xc3\xa9c\\d\n", pkg.worlds[0].externs[0].gate.external_id.?);
+    try testing.expectEqualStrings("plain", pkg.worlds[0].externs[1].gate.external_id.?);
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(),
+        \\package a:b;
+        \\world w {
+        \\  @external-id("bad\q")
+        \\  import f: func();
+        \\}
+    ));
 }
 
 test "named extern references keep the local name" {

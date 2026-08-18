@@ -28,7 +28,7 @@ zig build http-get     # builds zig-out/wasm/http-get.component.wasm
 zig build async-basic  # builds zig-out/wasm/async-basic.component.wasm
 zig build stream-demo  # builds zig-out/wasm/stream-demo.component.wasm
 zig build wasi-demo    # builds zig-out/wasm/wasi-demo.component.wasm
-zig build wasi-demo-p3 # builds zig-out/wasm/wasi-demo-p3.component.wasm (WASI 0.3.0)
+zig build wasi-demo-p3 # builds zig-out/wasm/wasi-demo-p3.component.wasm (WASI 0.3.1)
 
 # Run a component standalone via Wasmtime:
 wasmtime run --invoke 'manhattan({x:-3, y:4})' \
@@ -117,11 +117,11 @@ examples/
                     environment, terminal probes, a filesystem
                     round-trip, a DNS lookup, and an HTTPS GET in a
                     single guest.
-  wasi-demo-p3/     The same tour against WASI 0.3.0 via the
+  wasi-demo-p3/     The same tour against WASI 0.3.1 via the
                     `zig_wasi_components.wasi3` module: stream-based
                     stdio and file I/O, async clock sleeps, a
                     `stream<directory-entry>` listing, DNS — plus a
-                    `wasi:http/service@0.3.0` guest that serves real
+                    `wasi:http/service@0.3.1` guest that serves real
                     requests under `wasmtime serve` and makes an
                     outbound fetch through the 0.3 http client
                     wrappers on each one.
@@ -139,22 +139,31 @@ The parser ingests the full WIT surface used by real WASI 0.2.x /
 - `resource` with constructors, methods, static methods,
   `own<T>` / `borrow<T>`
 - `stream<T>`, `future<T>`, `error-context`
+- `map<K, V>` (WASI 0.3.1), bound as a slice of key/value pairs
+  through its canonical `list<tuple<K, V>>` despecialization
 - `async` functions
 - `@since(version = ...)` / `@unstable(feature = ...)` /
   `@deprecated(version = ...)` gates
+- `@external-id("...")` annotations (WASI 0.3.1)
 - inline interfaces in world imports/exports
+- plain-named interface imports/exports (WASI 0.3.1):
+  `import users: store;` and `import catalog: store;` bind the same
+  interface twice under distinct names, each with its own generated
+  namespace
 
 It has been validated against the published WIT files of the full
 `wasi:cli`, `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:sockets`,
 `wasi:filesystem` and `wasi:http` set at `0.2.12`, including the new
 `exit-with-code` call and the unstable `wasi:clocks/timezone`
-interface, and against the six final WASI `0.3.0` packages: every
-world in them generates bindings that compile, and components built
-from the generated `wasi:cli/command@0.3.0` and
-`wasi:http/service@0.3.0` bindings pass `wasm-tools component new`
+interface, and against the six final WASI `0.3.0` and `0.3.1`
+packages: every world in them generates bindings that compile, and
+components built from the generated `wasi:cli/command@0.3.1` and
+`wasi:http/service@0.3.1` bindings pass `wasm-tools component new`
 validation and run end to end under wasmtime 46+ (`wasmtime run
 -S p3` for the command world, `wasmtime serve -S p3,cli` for the
-http service, outbound requests included).
+http service, outbound requests included — wasmtime links the 0.3.1
+imports against its 0.3.0 implementations through semver-compatible
+resolution).
 The stream/future canon intrinsics are generated for *every*
 function that traffics in `stream<T>` / `future<T>` — async or sync,
 top-level or resource method — with canonical-layout `lift`/`lower`

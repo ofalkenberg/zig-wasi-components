@@ -152,8 +152,9 @@ satisfied and the very first call traps.
 On a WASI 0.3 component this is almost always a *version identity*
 mismatch, not an encoding bug. Wasmtime 46 and later ship the
 final `0.3.0` interfaces, so components built against final
-`@0.3.0` link and run as-is (both `wasmtime run -S p3` and
-`wasmtime serve -S p3,cli`). Older wasmtimes (45 and earlier)
+`@0.3.0` — or against `@0.3.1`, which links through
+semver-compatible resolution — run as-is (both `wasmtime run -S p3`
+and `wasmtime serve -S p3,cli`). Older wasmtimes (45 and earlier)
 vendor the `0.3.0-rc-2026-03-15` interfaces — the shapes are
 identical to final 0.3.0, but named types such as `error-code`
 carry their interface's version in their type identity, so a
