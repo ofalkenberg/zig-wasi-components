@@ -1,17 +1,18 @@
 # The `wasi` convenience module
 
-`src/wasi.zig` (re-exported as `zig_wasi_components.wasi`) wraps the
+`src/wasi.zig` is re-exported as `zig_wasi_components.wasi`. It wraps
 generated `wasi:cli`, `wasi:clocks`, `wasi:random`, `wasi:io`,
-`wasi:filesystem`, `wasi:sockets` and `wasi:http` bindings into a
-handful of functions that read the way you would expect them to. It
-exists for the common case where you do not want to learn the
-canonical-ABI resource lifecycle just to fetch a URL, read a file, or
-look up a hostname.
+`wasi:filesystem`, `wasi:sockets`, and `wasi:http` bindings in a
+small set of familiar functions.
+
+Use it when you do not want to learn the canonical-ABI resource
+lifecycle before fetching a URL, reading a file, or looking up a
+hostname.
 
 ## Wiring it up
 
-The module is generic over the bindings type so it works against any
-world that imports the relevant WASI interfaces:
+The module is generic over the bindings type. It works with any world
+that imports the relevant WASI interfaces:
 
 ```zig
 const std = @import("std");
@@ -20,8 +21,7 @@ const wasi = @import("zig_wasi_components").wasi.Wasi(bindings);
 ```
 
 Because Zig only semantically analyses the helpers that are actually
-called, you do not need every WASI interface in your world — only the
-ones whose helpers you reach for.
+called, you only need the interfaces whose helpers you use.
 
 ## What is in there
 
@@ -53,10 +53,9 @@ if (wasi.environment.get("HOME")) |home| { ... }
 // Exit (does not return)
 wasi.exit.success();
 
-// Files (paths are resolved against host preopens — the longest
-// matching prefix wins, the rest is treated as a sandboxed relative
-// path, so "/tmp/foo.txt" works when wasmtime was started with
-// `--dir /tmp`).
+// Files use host preopens. The longest matching prefix wins.
+// The remaining path is sandboxed and relative. Therefore,
+// "/tmp/foo.txt" works when wasmtime starts with `--dir /tmp`.
 try wasi.fs.writeFile("/tmp/hello.txt", "hi\n");
 const text = try wasi.fs.readFile(gpa, "/tmp/hello.txt");
 defer gpa.free(text);
@@ -113,8 +112,7 @@ world demo {
 The `wasi:cli/command` include drags in stdio, clocks, randomness,
 environment, exit and filesystem; the two extra imports add outbound
 HTTP. If your component does not make HTTP requests, drop the
-`wasi:http` lines — the wrapper's HTTP helpers will simply remain
-uncompiled.
+`wasi:http` lines. The wrapper's HTTP helpers will remain uncompiled.
 
 ## End-to-end example
 
@@ -172,8 +170,8 @@ Differences from the 0.2 wrapper worth knowing:
   future. The helpers do this dance internally and surface a plain
   `StreamError` / `FsError`.
 - `wasi3.http.fetch` supports methods and headers but not request
-  bodies yet — streaming a body requires interleaving writes with the
-  in-flight `client.send` call, which needs the state-machine async
+  bodies yet. Streaming a body requires interleaving writes with the
+  in-flight `client.send` call. That requires the state-machine async
   export form rather than a blocking helper.
 - TCP connections issue one `send` stream and one `receive` stream per
   socket (`connectTcp` sets both up; `write`/`readAll`/`close` work as
@@ -213,7 +211,8 @@ operation works through a `descriptor` for a preopened directory. The
 `wasi:filesystem/preopens.get-directories()` and picking the longest
 preopen path that is a prefix of yours. So if wasmtime was started
 with `--dir /tmp`, `wasi.fs.readFile(gpa, "/tmp/foo")` opens `foo`
-relative to the `/tmp` descriptor; anything that does not land under
-a preopen returns `error.NotPreopened`. Paths inside a preopen must
-not escape it — the host will reject `..` segments that climb above
-the root with `error.FsAccess`.
+relative to the `/tmp` descriptor. Anything outside a preopen returns
+`error.NotPreopened`.
+
+Paths inside a preopen must not escape it. The host rejects `..`
+segments that climb above the root with `error.FsAccess`.

@@ -1,16 +1,16 @@
 # Build-system integration
 
-Doing the codegen, the Zig compile, and the two `wasm-tools` steps
-by hand is fine while you are exploring. As soon as the project grows
-past a few files, you want it all driven by `zig build`. This page
-shows how, with a complete template you can paste into your own
-`build.zig`.
+Running codegen, compiling Zig, and invoking `wasm-tools` by hand is
+fine while you are exploring. Use `zig build` when the project grows
+past a few files.
 
-The template is exactly the pattern the bundled examples use. If you
-want the canonical implementation, `build.zig` at the root of this
-repo has seven worked variants (`demo`, `dual`, `resource`,
-`http-get`, `async-basic`, `wasi-demo`, `wasi-demo-p3`) you can crib
-from.
+This page provides a complete `build.zig` template. You can paste it
+into your own project.
+
+The bundled examples use this pattern. For the canonical
+implementation, see the root `build.zig`. It has seven worked
+variants: `demo`, `dual`, `resource`, `http-get`, `async-basic`,
+`wasi-demo`, and `wasi-demo-p3`.
 
 ## What the pipeline looks like
 
@@ -31,8 +31,8 @@ For a component with WASI deps, step 1 is preceded by:
 1a. Run `wasm-tools component wit <wit-dir>` and capture stdout
     into `resolved.wit`. Then feed that file to `gen`.
 
-The build-integration template below covers both cases — comment in
-the dep-resolution step when you need it.
+The build-integration template below covers both cases. Add the
+dependency-resolution step when you need it.
 
 ## Depend on `zig-wasi-components` from your project
 
@@ -47,8 +47,9 @@ Add the dependency to your `build.zig.zon`:
 },
 ```
 
-For local development, swap `.url`/`.hash` for `.path = "../zig-wasi-components"`
-(or wherever you have the project checked out).
+For local development, replace `.url` and `.hash` with
+`.path = "../zig-wasi-components"`. Use the path where you checked out
+the project.
 
 ## Template `build.zig`
 
@@ -129,9 +130,10 @@ Running `zig build component` produces
 ## Template extension: WASI deps
 
 If your WIT has a `deps/` tree, add a `wasm-tools component wit`
-step that resolves it into a single file, and feed that file to
-`gen` instead of the raw WIT. The full pattern from `build.zig`
-in this repo is:
+step. It resolves the tree into a single file. Feed that file to
+`gen` instead of the raw WIT.
+
+The full pattern from this repository's `build.zig` is:
 
 ```zig
 const resolve = b.addSystemCommand(&.{ "wasm-tools", "component", "wit" });
@@ -141,7 +143,7 @@ const resolved = resolve.captureStdOut(.{ .basename = "resolved.wit" });
 
 const gen = b.addRunArtifact(gen_exe);
 gen.addArg("gen");
-gen.addFileArg(resolved);     // not a static path — the captured output
+gen.addFileArg(resolved);     // Captured output, not a static path.
 gen.addArg("my-world");
 const bindings = gen.captureStdOut(.{ .basename = "bindings.zig" });
 ```
@@ -160,12 +162,14 @@ const embedded = embed.addPrefixedOutputFileArg("-o", "embedded.wasm");
 
 ## Why `addWitTreeAsInputs` is necessary
 
-`addDirectoryArg` only registers the directory entry as a build
-input, not the files underneath. If you edit a `.wit` inside `deps/`,
-Zig's build cache does not see the change and happily reuses the
-stale embedded.wasm. The helper at the top of `build.zig` walks the
-tree at configure time and registers every `.wit` file as an
-explicit input.
+`addDirectoryArg` registers the directory entry as a build input. It
+does not register files below it.
+
+If you edit a `.wit` file inside `deps/`, Zig's build cache misses the
+change. It then reuses the stale `embedded.wasm`.
+
+The helper at the top of `build.zig` walks the tree at configure time.
+It registers every `.wit` file as an explicit input.
 
 You can lift the helper into your own `build.zig` verbatim:
 
@@ -193,28 +197,28 @@ fn addWitTreeAsInputs(b: *std.Build, run: *std.Build.Step.Run, rel_root: []const
 ## Why `exe.entry = .disabled` and `exe.rdynamic = true`
 
 Components do not have a `main`. The first line tells the Zig wasm
-linker not to require one. The second tells it to keep every
-publicly exported symbol in the output even when it appears
-unused — which is exactly the case for `cabi_realloc`, every
-`export fn`, and every `cabi_post_*`.
+linker not to require one. The second retains every public export,
+even if it appears unused.
 
-Without `rdynamic = true`, the linker strips the exports and
-`wasm-tools component embed` either fails or produces a component
-that crashes on first invocation.
+That includes `cabi_realloc`, every `export fn`, and every
+`cabi_post_*`. Without `rdynamic = true`, the linker strips these
+exports. Then `wasm-tools component embed` either fails or produces a
+component that crashes on its first invocation.
 
 ## Where to find the canonical template
 
-Read `build.zig` at the repo root. The `demo`, `dual`, `resource`,
-and `async-basic` steps each implement the dep-less variant; the
-`http-get` and `wasi-demo` steps implement the WASI dep-tree
-variant. Each one is well isolated and self-contained. Lifting any
-of them into a fresh project is straight copy-paste with the file
-paths swapped.
+Read the root `build.zig`. The `demo`, `dual`, `resource`, and
+`async-basic` steps use the dep-less variant. The `http-get` and
+`wasi-demo` steps use the WASI dependency-tree variant.
 
-The `wasi-demo-p3` step shows a third option: when the WIT is
-already a single fully-resolved file (no `deps/` tree), the whole
-gen → compile → embed → `component new` pipeline collapses into the
-`addComponent` helper at the top of `build.zig`, driven by a small
-`ComponentSpec` literal (name, root source, WIT path, world). If
-your project builds several components from pre-resolved WIT files,
-that helper is the thing to lift.
+Each step is isolated and self-contained. You can copy one into a new
+project and change the file paths.
+
+The `wasi-demo-p3` step shows a third option. It applies when the WIT
+is already a fully resolved file without a `deps/` tree. The
+`addComponent` helper then performs code generation, compilation,
+embedding, and `component new`. A small `ComponentSpec` literal
+supplies the name, root source, WIT path, and world.
+
+Copy that helper if your project builds several components from
+pre-resolved WIT files.

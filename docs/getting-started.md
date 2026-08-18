@@ -1,27 +1,29 @@
 # Getting started
 
-This page covers what you need installed, how to build the bundled
-examples, and what their output should look like. If everything in here
-works, you have a working toolchain and can move on to
-[your first component](workflow.md).
+This page lists the required tools.
+It explains how to build the bundled examples.
+It also shows what their output should look like.
+
+If these steps work, your toolchain works.
+You can then continue to [your first component](workflow.md).
 
 ## What you need
 
 - **Zig 0.17.0-dev** (specifically `0.17.0-dev.639+284ab0ad8` or newer).
-  The project tracks Zig master and uses APIs from the new `Io`
-  namespace, unmanaged `ArrayList`, and the `std.process.Init` entry
-  point. An older compiler will not parse `src/main.zig`.
-- **`wasm-tools`** on your `PATH`. The `embed`, `new`, and `wit`
-  subcommands are invoked by the build script. Install with
-  `cargo install wasm-tools` if you do not already have it.
-- **Wasmtime**, if you want to actually run the components. Any 24+
-  release will do; the `http-get` demo needs 32+ for the `wasi:http`
-  outbound surface.
-- **A Rust toolchain** is only needed for the demos that have a Rust
-  host (`greeter`, `dual`, `resource`, `async-basic`, `stream-demo`).
-  It is not needed to build or use the codegen itself.
-- **`cargo-component`**, additionally, for the Rust half of the
-  `dual` demo. Install with `cargo install cargo-component`.
+  The project tracks Zig master.
+  It uses the new `Io` namespace, unmanaged `ArrayList`, and `std.process.Init`.
+  An older compiler cannot parse `src/main.zig`.
+- **`wasm-tools`** on your `PATH`.
+  The build script invokes the `embed`, `new`, and `wit` subcommands.
+  Install it with `cargo install wasm-tools` if needed.
+- **Wasmtime** to run components.
+  Any 24+ release works.
+  The `http-get` demo needs 32+ for `wasi:http` outbound support.
+- **A Rust toolchain** only for demos with a Rust host.
+  These are `greeter`, `dual`, `resource`, `async-basic`, and `stream-demo`.
+  It is not needed to build or use the code generator.
+- **`cargo-component`** for the Rust half of the `dual` demo.
+  Install it with `cargo install cargo-component`.
 
 ## Build the codegen CLI
 
@@ -29,10 +31,12 @@ works, you have a working toolchain and can move on to
 zig build
 ```
 
-This produces `zig-out/bin/zig_wasi_components`, the CLI used by every
-other build step (and the one you will use directly when generating
-bindings for your own projects). Running it with no arguments prints a
-short usage line; see the [CLI reference](cli.md) for full details.
+This produces `zig-out/bin/zig_wasi_components`.
+Every other build step uses this CLI.
+You will also use it directly for bindings in your own projects.
+
+Running it without arguments prints a short usage line.
+See the [CLI reference](cli.md) for details.
 
 ## Run the unit tests
 
@@ -40,19 +44,22 @@ short usage line; see the [CLI reference](cli.md) for full details.
 zig build test
 ```
 
-The parser and codegen each have their own test module. Both run in
-parallel; expect a couple of seconds total. Tests cover every WIT type
-the codegen knows how to lift and lower in both directions, plus a
-catalog of edge cases (indirect parameter areas, fixed-length lists,
-resource methods with more than 16 flat params, and so on).
+The parser and code generator each have a test module.
+They run in parallel.
+Expect the tests to take a few seconds.
 
-If a parser test fails, the most likely cause is an upstream WIT grammar
-addition that has not been ported yet — check the WASIp3 spec.
+Tests cover every WIT type that the code generator lifts and lowers.
+They cover both directions.
+They also cover edge cases, including indirect parameter areas and fixed-length lists.
+Resource methods with more than 16 flat parameters are covered too.
+
+A parser failure often means an upstream WIT grammar addition needs porting.
+Check the WASIp3 specification.
 
 ## Build the bundled examples
 
-Eight example components ship in `examples/`. Each demonstrates a
-different slice of the canonical ABI.
+Eight example components ship in `examples/`.
+Each demonstrates a different canonical-ABI feature.
 
 ```sh
 zig build demo         # zig-out/wasm/greeter.component.wasm
@@ -65,22 +72,24 @@ zig build wasi-demo    # zig-out/wasm/wasi-demo.component.wasm
 zig build wasi-demo-p3 # zig-out/wasm/wasi-demo-p3.component.wasm
 ```
 
-You can run any one of them in isolation. None of the eight steps depend
-on each other, and `zig build` with no argument will not build any of
-them (so the default build stays fast).
+Run each example independently.
+None of the eight build steps depends on another.
+`zig build` without an argument does not build them.
+The default build therefore stays fast.
 
 ### The greeter demo
 
-The greeter is the most thorough type-coverage example. It exercises
-records, lists, variants, options, results, tuples, flags, indirect
-parameters, indirect results, both directions of `char` and `string`,
-and a host-provided `log` import the guest calls back into.
+The greeter provides the most thorough type coverage.
+It exercises records, lists, variants, options, results, tuples, and flags.
+It also covers indirect parameters and results.
+Both `char` and `string` directions are tested.
+The guest calls a host-provided `log` import.
 
-The greeter has host-provided imports (`log`, `origin`,
-`label-point`), so running it standalone with
-`wasmtime run --invoke` does not work — Wasmtime refuses to start a
-component with unsatisfied imports. Use the bundled Rust host
-instead, which provides those imports and exercises every export:
+The greeter imports `log`, `origin`, and `label-point` from its host.
+It cannot run standalone with `wasmtime run --invoke`.
+Wasmtime refuses to start components with unsatisfied imports.
+Use the bundled Rust host instead.
+It supplies those imports and exercises every export.
 
 ```sh
 cargo build --release --manifest-path examples/greeter/rust-host/Cargo.toml
@@ -88,17 +97,19 @@ cargo build --release --manifest-path examples/greeter/rust-host/Cargo.toml
   zig-out/wasm/greeter.component.wasm
 ```
 
-The Rust host prints one line per export with the result, and
-finishes with `OK — Rust ↔ Zig component interop (both directions)
-verified.` If you see that line, you have a working component.
+The Rust host prints one line for every export result.
+It ends with `OK: Rust ↔ Zig component interop (both directions) verified.`
+That line confirms a working component.
 
 ### The dual demo
 
-`dual` is the smallest possible end-to-end test: a one-function `math`
-world with `export add: func(a: u32, b: u32) -> u32`. The same WIT
-compiles to two interchangeable components — one written in Zig, one
-written in Rust with `cargo-component`. A single Rust host loads
-whichever you point it at.
+`dual` is the smallest end-to-end test.
+Its `math` world has one function: `export add: func(a: u32, b: u32) -> u32`.
+
+The same WIT produces two interchangeable components.
+One uses Zig.
+The other uses Rust with `cargo-component`.
+One Rust host loads either component.
 
 ```sh
 cargo build --release --manifest-path examples/dual/host/Cargo.toml
@@ -109,15 +120,14 @@ cargo build --release --manifest-path examples/dual/host/Cargo.toml
   examples/dual/rust-impl/target/wasm32-wasip1/release/math.wasm
 ```
 
-The host calls `add(2, 3)` against both components and verifies they
-both answer `5`. This is the test that proves the Zig binding is wire-
-compatible with the canonical Rust binding for the same WIT.
+The host calls `add(2, 3)` on both components.
+It verifies that both return `5`.
+This confirms that Zig bindings are wire-compatible with Rust bindings for the same WIT.
 
 ### The resource demo
 
-`resource` is the lifecycle test for WIT resources. It defines a
-`counter` resource with a constructor, two methods, an accessor, and an
-implicit destructor:
+`resource` tests the lifecycle of WIT resources.
+It defines a `counter` resource with a constructor, two methods, an accessor, and an implicit destructor.
 
 ```wit
 resource counter {
@@ -128,38 +138,40 @@ resource counter {
 }
 ```
 
-The Zig implementation lives in `examples/resource/component.zig` and
-fits on one screen. The Rust host creates a few counters, mutates them,
-verifies their state, and lets the implicit `drop` run as they go out
-of scope. See [the resources doc](resources.md) for the full
-implementation pattern.
+The Zig implementation is in `examples/resource/component.zig`.
+It fits on one screen.
+The Rust host creates counters, mutates them, and verifies their state.
+It then lets each implicit `drop` run at the end of the resource's scope.
+See [the resources doc](resources.md) for the full pattern.
 
 ### The http-get demo
 
-This is the largest example. The component reaches out to
-`https://example.com/`, streams the response body, and writes it to
-stdout — all via generated `wasi:http`, `wasi:io`, and `wasi:cli`
-bindings.
+This is the largest example.
+The component requests `https://example.com/`.
+It streams the response body to stdout.
+It uses generated `wasi:http`, `wasi:io`, and `wasi:cli` bindings.
 
 ```sh
 zig build http-get
 wasmtime run -S http=y zig-out/wasm/http-get.component.wasm
 ```
 
-The first wasm-tools call resolves the world plus every transitive dep
-from `examples/http-get/wit/deps/` into a single multi-package WIT file,
-which is then handed to `zig_wasi_components gen`. The output is a
-~30KB `bindings.zig` covering the entire wasi-0.2.6 surface needed by
-`world client`. See [the WASI doc](wasi.md) for the toolchain pattern.
+The first `wasm-tools` call resolves the world and every transitive dependency.
+It reads dependencies from `examples/http-get/wit/deps/`.
+It creates one multi-package WIT file.
+`zig_wasi_components gen` receives that file.
+
+The result is a roughly 30 KB `bindings.zig` file.
+It covers the wasi-0.2.6 surface needed by `world client`.
+See [the WASI doc](wasi.md) for this toolchain pattern.
 
 ### The async-basic demo
 
-`async-basic` exercises the async-with-callback canonical ABI in both
-directions. The Zig guest exports four `async func` bindings (`succ`,
-`measure`, `greet`, `promise`) that go through the full
-`[async-lift]` / `[callback]` / `[task-return]` machinery, and a
-fifth (`relay`) that calls an async host import via `[async-lower]`.
-A tokio-based Rust host drives the whole thing:
+`async-basic` exercises the async-with-callback canonical ABI in both directions.
+The Zig guest exports four `async func` bindings: `succ`, `measure`, `greet`, and `promise`.
+They use the complete `[async-lift]`, `[callback]`, and `[task-return]` flow.
+A fifth function, `relay`, calls an async host import through `[async-lower]`.
+A tokio-based Rust host drives the example.
 
 ```sh
 zig build async-basic
@@ -179,18 +191,20 @@ promise(21) -> 42
 OK
 ```
 
-The host instantiates the component with `instantiate_async`, runs
-its calls under `run_concurrent`, and attaches stream and future
-consumers to drain the `greet` and `promise` results. If that line
-prints, async export *and* async import paths are wired correctly.
+The host instantiates the component with `instantiate_async`.
+It runs calls under `run_concurrent`.
+It attaches stream and future consumers to drain `greet` and `promise`.
+This output confirms that async export and import paths work.
 
 ### The stream-demo demo
 
-`async-basic` already returns a `stream<u8>`, but bytes take the
-canonical ABI's fast path. `stream-demo` is the example for typed,
-non-byte streams: the guest exports `squares -> stream<u32>` and
-`fibonacci -> stream<u64>`, both built from one generic producer, so
-the same machinery has to lift four- and eight-byte elements.
+`async-basic` already returns a `stream<u8>`.
+Bytes use the canonical ABI fast path.
+`stream-demo` demonstrates typed, non-byte streams instead.
+
+The guest exports `squares -> stream<u32>` and `fibonacci -> stream<u64>`.
+Both use one generic producer.
+This tests lifting four-byte and eight-byte elements.
 
 ```sh
 zig build stream-demo
@@ -207,16 +221,15 @@ fibonacci(10) -> [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
 OK
 ```
 
-The Rust host drains both readable ends with a single generic
-`Collector<T>` that reads typed items straight out of the
-component-model `Source<T>`.
+The Rust host drains both readable ends with one generic `Collector<T>`.
+It reads typed items directly from the component-model `Source<T>`.
 
 ### The wasi-demo demo
 
-`wasi-demo` drives the [`wasi` convenience module](wasi-module.md)
-against a real `wasi:cli/command@0.2.6` world: clocks, randomness,
-stdio, environment, terminal probes, a filesystem round-trip, a DNS
-lookup, and a live HTTPS GET, all in one guest.
+`wasi-demo` uses the [`wasi` convenience module](wasi-module.md).
+It targets a real `wasi:cli/command@0.2.6` world.
+One guest exercises clocks, randomness, stdio, environment, and terminal probes.
+It also performs a filesystem round trip, DNS lookup, and live HTTPS GET.
 
 ```sh
 zig build wasi-demo
@@ -228,28 +241,29 @@ wasmtime run \
 
 ### The wasi-demo-p3 demo
 
-`wasi-demo-p3` is the same tour against the final
-`wasi:cli/command@0.3.1` world via the `wasi3` module: stream-based
-stdio and file I/O, async clock sleeps, a `stream<directory-entry>`
-listing, and DNS. The step also compile-checks an http guest against
-`wasi:http/service@0.3.1` and validates both components with
-`wasm-tools component new`.
+`wasi-demo-p3` covers the same features through the `wasi3` module.
+It targets the final `wasi:cli/command@0.3.1` world.
+It covers stream-based stdio, file I/O, and async clock sleeps.
+It also lists a `stream<directory-entry>` and performs DNS.
+
+The build also checks an HTTP guest against `wasi:http/service@0.3.1`.
+It validates both components with `wasm-tools component new`.
 
 ```sh
 zig build wasi-demo-p3
 ```
 
-Wasmtime 46 and later implement the final WASI 0.3.0 interfaces and
-link the 0.3.1 imports through semver-compatible resolution, so the
-demo runs as-is — see [the `wasi` module doc](wasi-module.md) for
-the run command. Wasmtime 45 and earlier only vendor the March 2026
-release candidate and will not link a final-0.3.x component.
+Wasmtime 46 and later implement the final WASI 0.3.0 interfaces.
+They link 0.3.1 imports through semver-compatible resolution.
+The demo runs without changes.
+See [the `wasi` module doc](wasi-module.md) for the run command.
+
+Wasmtime 45 and earlier only vendor the March 2026 release candidate.
+They cannot link a final-0.3.x component.
 
 ## Where to next
 
-- Pick a WIT file you want to bind, even something tiny, and follow
-  [your first component](workflow.md). It is the most direct path to
-  understanding how everything fits together.
-- If you intend to host the resulting components in Rust, the
-  Rust-side code in `examples/greeter/rust-host/` and
-  `examples/resource/host/` is good shape to copy.
+- Pick a WIT file to bind, even a tiny one.
+  Follow [your first component](workflow.md).
+  It gives the most direct explanation of the full workflow.
+- Rust hosts can copy the structure in `examples/greeter/rust-host/` or `examples/resource/host/`.

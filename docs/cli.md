@@ -1,14 +1,16 @@
 # The CLI
 
-`zig_wasi_components` is the single binary the build steps invoke and
-the one you call directly when generating bindings for your own
-projects. It exposes two subcommands: `dump`, which prints a summary
-of a parsed WIT file, and `gen`, which emits Zig source for a chosen
-world.
+`zig_wasi_components` is the binary used by build steps.
+Use it directly to generate bindings for your own projects.
 
-After running `zig build`, the binary lives at
-`zig-out/bin/zig_wasi_components`. The rest of this page assumes you
-have it on your `PATH` or call it via that path.
+It has two subcommands:
+
+- `dump` prints a parsed WIT file summary.
+- `gen` emits Zig source for a selected world.
+
+After `zig build`, the binary is at `zig-out/bin/zig_wasi_components`.
+This page assumes that path is on your `PATH`.
+You can also call it directly.
 
 ## Usage at a glance
 
@@ -17,20 +19,22 @@ zig_wasi_components dump <wit-file>           describe a WIT file
 zig_wasi_components gen  <wit-file> <world>   emit Zig bindings to stdout
 ```
 
-Both subcommands take a single `.wit` file as input. The file must be
-self-contained: any `use foo:bar/baz` cross-package reference must
-either resolve to a package block already present in the same file
-(the multi-package format produced by `wasm-tools component wit`) or
-to a type defined elsewhere in the same file. The CLI does not chase
-a `deps/` directory by itself. The [WASI doc](wasi.md) shows how to
-preflatten a directory tree into a single file.
+Both subcommands accept one `.wit` file.
+The file must be self-contained.
+
+A `use foo:bar/baz` cross-package reference must resolve within that file.
+It can resolve to an existing package block.
+This is the multi-package format created by `wasm-tools component wit`.
+It can also resolve to a type elsewhere in that file.
+
+The CLI does not search a `deps/` directory itself.
+The [WASI doc](wasi.md) explains how to flatten a directory tree into one file.
 
 ## `dump`
 
-`dump` parses the file and prints a short description of what it
-contains. Useful for two things: confirming the parser accepts your
-file at all, and figuring out the right world name to pass to `gen`
-when you forget.
+`dump` parses a file and prints a short description.
+Use it to confirm that the parser accepts a file.
+Use it to find the world name for `gen`.
 
 ```sh
 $ zig_wasi_components dump examples/greeter/greeter.wit
@@ -45,36 +49,40 @@ package demo:greeter@0.1.0
     ...
 ```
 
-The summary lists every world declared in the file with its imports
-and exports, then every interface, then every cross-package
-dependency that was named but not inlined. Errors are surfaced
-inline; if `dump` rejects the file with a parse error, `gen` will
-reject it the same way.
+The summary lists each world with its imports and exports.
+It then lists every interface.
+It finally lists named cross-package dependencies that are not inlined.
+
+Errors appear inline.
+If `dump` reports a parse error, `gen` reports the same error.
 
 ## `gen`
 
-`gen` parses the file, locates the named world, and writes the
-generated Zig source to stdout. Redirect to a file or pipe into your
-build:
+`gen` parses the file and finds the named world.
+It writes generated Zig source to stdout.
+Redirect the output to a file or pipe it into a build.
 
 ```sh
 zig_wasi_components gen examples/greeter/greeter.wit greeter > bindings.zig
 ```
 
-The world argument is a **bare identifier** — the name as it appears
-after the `world` keyword, with no package prefix. If your WIT
-declares `world client`, the argument is `client`, not
-`demo:httpget/client`.
+The world argument is a **bare identifier**.
+Use the name after the `world` keyword.
+Do not include a package prefix.
 
-If the world is not found, the CLI prints a friendly error that
-lists every world the file does contain (and, if there are none,
-every interface). The exit status is non-zero so build scripts
-notice.
+For `world client`, pass `client`.
+Do not pass `demo:httpget/client`.
+
+If the world is missing, the CLI prints a friendly error.
+It lists the worlds declared in the file.
+If the file has no worlds, it lists interfaces instead.
+The CLI exits with a non-zero status.
+Build scripts can detect the failure.
 
 ```
 $ zig_wasi_components gen examples/http-get/wit/deps/sockets/udp.wit udp
 error: world 'udp' not found in examples/http-get/wit/deps/sockets/udp.wit
-       this file declares no worlds — only interfaces and/or types.
+       this file declares no worlds; only interfaces and/or types.
        'gen' needs a `world <name> { … }` declaration; try `dump` to inspect the file.
        interfaces in this file:
          - udp
@@ -82,56 +90,48 @@ error: world 'udp' not found in examples/http-get/wit/deps/sockets/udp.wit
 
 ### What `gen` actually emits
 
-The output has a fixed top-level structure, always in this order:
+The output has a fixed top-level structure:
 
-1. A header comment naming the source package and world.
-2. The standard imports (`std`, the project's `abi` module).
-3. Every type declared in the world or in any used interface,
-   rendered as Zig structs, unions, enums, packed structs, or type
-   aliases. See the [bindings doc](bindings.md) for the full type
-   mapping.
-4. `pub const imports = struct { ... }` containing one Zig wrapper
-   for each function the world *imports*. Each wrapper packs its
-   Zig-typed arguments into the canonical flat representation,
-   calls a private `@extern` declaration, and lifts the result back.
-5. A reference to your `wit_exports` namespace.
-6. The `cabi_realloc` export, backed by the arena allocator in
-   `src/abi.zig`.
-7. One `export fn <name>(...)` per world-level export, each lifting
-   flat canonical-ABI parameters into Zig types, calling
-   `wit_exports.<name>(...)`, and lowering the result back into
-   flat slots or the indirect return area.
-8. One `export fn cabi_post_<name>(...)` per export that needs a
-   post-return hook (anything returning a string, list, record,
-   variant, option, or result through the indirect return area).
-9. If the world exports interfaces, a nested `pub const <iface>`
-   namespace inside a per-interface block, and the corresponding
-   `export fn <iface>#<func>` thunks.
+1. A header comment that names the source package and world.
+2. Standard imports: `std` and the project's `abi` module.
+3. Every used world and interface type.
+   The generator renders structs, unions, enums, packed structs, and aliases.
+   See the [bindings doc](bindings.md) for the complete mapping.
+4. `pub const imports = struct { ... }`.
+   It contains a Zig wrapper for every imported world function.
+   Each wrapper lowers Zig arguments to canonical flat values.
+   It calls a private `@extern` declaration and lifts the result.
+5. A reference to the `wit_exports` namespace.
+6. The `cabi_realloc` export, backed by the arena allocator in `src/abi.zig`.
+7. One `export fn <name>(...)` for every world-level export.
+   Each lifts flat canonical-ABI parameters to Zig types.
+   It calls `wit_exports.<name>(...)` and lowers the result.
+   Results use flat slots or an indirect return area.
+8. One `export fn cabi_post_<name>(...)` for every export needing a post-return hook.
+   This includes strings, lists, records, variants, options, and indirect results.
+9. When the world exports interfaces, a nested `pub const <iface>` namespace in every interface block.
+   The output also includes `export fn <iface>#<func>` thunks.
 
-The full anatomy is in [bindings.md](bindings.md). If you intend to
-hand-write or maintain bindings, that page is the one to read in
-detail.
+See [bindings.md](bindings.md) for the full anatomy.
+Read that page before hand-writing or maintaining bindings.
 
 ## Exit codes
 
-- `0` — success.
-- non-zero — anything else, including `WorldNotFound`, parse
-  errors, or I/O errors reading the input. The error message goes
-  to stderr.
+- `0`: success.
+- non-zero: all other outcomes, including `WorldNotFound`, parse errors, and input I/O errors.
+  The CLI writes its error message to stderr.
 
-The CLI does not have a `--help` flag yet. Running it with no
-arguments prints the usage line, which is the same as the heading
-of this page.
+The CLI does not support `--help` yet.
+Running it without arguments prints the usage line.
+It matches this page's usage heading.
 
 ## Integrating in shell scripts
 
-The simplest pattern is to redirect stdout to a file:
+The simplest pattern redirects stdout to a file:
 
 ```sh
 zig_wasi_components gen world.wit my-world > bindings.zig
 ```
 
-Inside `build.zig` the same effect is achieved with
-`captureStdOut(.{ .basename = "bindings.zig" })` on the run step.
-See [build-integration.md](build-integration.md) for a complete
-template.
+In `build.zig`, call `captureStdOut(.{ .basename = "bindings.zig" })` on the run step.
+See [build-integration.md](build-integration.md) for a complete template.

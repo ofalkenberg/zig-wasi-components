@@ -1,21 +1,23 @@
 # Your first component
 
-This page walks through building a component from scratch: writing a
-small WIT, generating bindings, implementing the exports in Zig,
-wrapping the core module into a component, and running it. By the end
-you will have a working `.component.wasm` you can invoke from
-Wasmtime or load into a Rust host.
+This page builds a component from scratch.
+You will write a small WIT file and generate bindings.
+You will implement its exports in Zig.
+You will then wrap the core module as a component and run it.
 
-The example we will build is intentionally tiny — a single function
-that takes two integers and returns their sum, plus one that echoes a
-string back with a prefix. Once the loop is in place, scaling it up
-is just a matter of adding more WIT items and more `wit_exports`
-functions.
+By the end, you will have a working `.component.wasm`.
+You can invoke it from Wasmtime or load it into a Rust host.
+
+The example is intentionally small.
+One function adds two integers.
+Another echoes a string with a prefix.
+
+Once this loop works, add more WIT items and `wit_exports` functions.
 
 ## 1. Write the WIT
 
-Create a fresh directory anywhere you like. We will use
-`tmp/hello/` for this walkthrough.
+Create a directory anywhere you like.
+This walkthrough uses `tmp/hello/`.
 
 ```sh
 mkdir -p tmp/hello
@@ -32,17 +34,18 @@ world hello {
 }
 ```
 
-Two exports, no imports, no resources. The package id is required —
-omitting it makes `wasm-tools component embed` fail with an
-unhelpful error.
+This world has two exports.
+It has no imports or resources.
+The package ID is required.
+Without it, `wasm-tools component embed` fails with an unhelpful error.
 
-Sanity-check the file by dumping it:
+Check the file by dumping it:
 
 ```sh
 ./zig-out/bin/zig_wasi_components dump tmp/hello/hello.wit
 ```
 
-You should see one world with two `export` lines.
+The output should contain one world with two `export` lines.
 
 ## 2. Generate bindings
 
@@ -51,21 +54,19 @@ You should see one world with two `export` lines.
   > tmp/hello/bindings.zig
 ```
 
-The output is about 60 lines for this world. Open it if you are
-curious — the relevant parts are:
+The output is about 60 lines for this world.
+Open it if you are curious.
+The important parts follow:
 
-- `cabi_realloc`, exported automatically.
-- `export fn add(p0: i32, p1: i32) i32` — a thunk that bitcasts its
-  two `i32` inputs to `u32`, calls `exports.add(...)`, and returns
-  the result.
-- `export fn greet(p0: i32, p1: i32) i32` — a thunk that
-  reconstructs a `[]const u8` from the pointer and length pair the
-  canonical ABI passes in, calls `exports.greet(...)`, and writes
-  the returned slice's pointer and length into a small return area
-  whose address is the single `i32` return value.
-- `export fn cabi_post_greet(_r: i32)` — invoked by the host after
-  it has lifted the string out, so the guest can reclaim the
-  memory if it wants to.
+- `cabi_realloc`, which is exported automatically.
+- `export fn add(p0: i32, p1: i32) i32`, a thunk that bitcasts two `i32` inputs to `u32`.
+  It calls `exports.add(...)` and returns the result.
+- `export fn greet(p0: i32, p1: i32) i32`, a thunk that rebuilds a `[]const u8` from the canonical pointer and length.
+  It calls `exports.greet(...)`.
+  It writes the returned slice pointer and length into a small return area.
+  The return area address is the single `i32` result.
+- `export fn cabi_post_greet(_r: i32)`, which the host invokes after lifting the string.
+  The guest can then reclaim memory if needed.
 
 ## 3. Implement the exports
 
@@ -95,24 +96,22 @@ pub const wit_exports = struct {
 };
 ```
 
-Two things worth understanding here:
+Two details matter here.
 
-The `comptime { _ = bindings; }` block is what pulls the generated
-thunks into the final binary. Without it, the export functions
-`add` and `greet` are dead code from the linker's point of view and
-get stripped. Every Zig component that uses generated bindings
-needs this line.
+The `comptime { _ = bindings; }` block pulls generated thunks into the final binary.
+Without it, the linker sees `add` and `greet` as dead code.
+It strips them.
+Every Zig component using generated bindings needs this line.
 
-The `wit_exports` namespace is the contract the generated bindings
-expect. The generator emits `const exports = @import("root").wit_exports;`
-near the top of `bindings.zig`, and each `export fn` calls
-`exports.<func_name>(...)`. WIT names with hyphens are converted to
-underscores (`format-greeting` becomes `format_greeting`).
+The `wit_exports` namespace is the generated bindings contract.
+The generator emits `const exports = @import("root").wit_exports;` near the top of `bindings.zig`.
+Each `export fn` calls `exports.<func_name>(...)`.
+WIT hyphens become underscores.
+For example, `format-greeting` becomes `format_greeting`.
 
-The memory returned from `greet` lives in the canonical-ABI arena
-backed by `cabi_realloc`. The host copies the bytes out before
-calling `cabi_post_greet`, so you do not need to retain the buffer
-yourself.
+Memory returned by `greet` uses the canonical-ABI arena behind `cabi_realloc`.
+The host copies the bytes before calling `cabi_post_greet`.
+You do not need to keep the buffer.
 
 ## 4. Compile to a core wasm module
 
@@ -125,21 +124,23 @@ zig build-exe -fno-entry -OReleaseSmall -target wasm32-freestanding -rdynamic \
   -femit-bin=tmp/hello/hello.core.wasm
 ```
 
-The command is long because we are doing manually what `build.zig`
-normally does for you. In a real project you should use the
-build-system integration — see [build-integration.md](build-integration.md)
-for a clean template. Once that template is in place, this step
-becomes `zig build hello`.
+The command is long because it performs `build.zig` work manually.
+Use build-system integration in a real project.
+See [build-integration.md](build-integration.md) for a clean template.
+With that template, this step becomes `zig build hello`.
 
-Three flags worth understanding. `-fno-entry` because component
-guest modules do not have a `main`. `-rdynamic` because the wasm
-linker would otherwise strip every `export fn` as unused — there
-are no internal callers, only the canonical-ABI thunks the host
-will reach. The chain of `--dep`/`-M` flags declares three modules:
-`root` (your `component.zig`) depending on both `bindings` and
-`zig_wasi_components`; `bindings` (the generated file) depending on
-`zig_wasi_components`; and `zig_wasi_components` itself (this
-project's runtime helpers).
+Three details matter.
+
+Use `-fno-entry` because component guests have no `main`.
+Use `-rdynamic` because the wasm linker otherwise removes every unused `export fn`.
+The host reaches canonical-ABI thunks externally.
+No internal call reaches them.
+
+The `--dep` and `-M` flags declare three modules:
+
+- `root`, your `component.zig`, depends on `bindings` and `zig_wasi_components`.
+- `bindings`, the generated file, depends on `zig_wasi_components`.
+- `zig_wasi_components` provides this project's runtime helpers.
 
 ## 5. Wrap as a component
 
@@ -150,19 +151,16 @@ wasm-tools component new tmp/hello/hello.embedded.wasm \
   -o tmp/hello/hello.component.wasm
 ```
 
-`component embed` adds the `component-type` custom section that
-tells `component new` which interface every wasm import and export
-belongs to. `component new` then rewrites the module into the
-component-model binary format, with the canonical ABI's adapter
-functions and type definitions all wired up.
+`component embed` adds the `component-type` custom section.
+That section describes the interface for each wasm import and export.
+`component new` rewrites the module into component-model binary format.
+It wires the canonical ABI adapter functions and type definitions.
 
-If either step rejects the module, the error message names the
-exact import or export that failed. The most common cause is a
-mismatch between the WIT and the implementation — for example, you
-exported `format_greeting` in Zig but the WIT calls it
-`format-greeting`. The CLI converts WIT hyphens to underscores in
-Zig names; if you skipped that, the generated bindings will not
-compile.
+If a step rejects the module, its error names the failing import or export.
+A common cause is a WIT and implementation mismatch.
+For example, Zig may export `format_greeting` while WIT declares `format-greeting`.
+The CLI changes WIT hyphens to Zig underscores.
+Generated bindings will not compile if you skip that change.
 
 ## 6. Run it
 
@@ -178,16 +176,15 @@ If both invocations work, you have a fully functional component.
 
 ## What to do next
 
-- **Add an import.** Change the WIT to `import log: func(msg: string);`
-  and rerun `gen`. The bindings now have a `pub const imports = struct { ... }`
-  block with a `log` wrapper you can call from your exports.
-- **Add a more complex type.** Records, variants, and lists all work
-  the same way — declare them in the WIT, regenerate, and use the
-  matching Zig type. The full mapping is in [bindings.md](bindings.md).
-- **Add a resource.** See [resources.md](resources.md) for the
-  pattern; the `examples/resource/` directory is the runnable
-  reference.
-- **Move into a `build.zig`.** Doing all of the above by hand gets
-  old fast. [build-integration.md](build-integration.md) has a
-  copy-pasteable template that handles all of step 4 and step 5
-  automatically.
+- **Add an import.** Change the WIT to `import log: func(msg: string);`.
+  Rerun `gen`.
+  The bindings now contain `pub const imports = struct { ... }` with a `log` wrapper.
+  Call it from your exports.
+- **Add a more complex type.** Records, variants, and lists follow the same pattern.
+  Declare them in WIT, regenerate bindings, and use the matching Zig type.
+  See [bindings.md](bindings.md) for the complete mapping.
+- **Add a resource.** See [resources.md](resources.md) for the pattern.
+  `examples/resource/` is the runnable reference.
+- **Move into a `build.zig`.** Manual builds become tedious.
+  [build-integration.md](build-integration.md) includes a copy-pasteable template.
+  It automates steps 4 and 5.
