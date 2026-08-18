@@ -1,22 +1,27 @@
 # zig-wasi-components
 
-WebAssembly Component Model support in Zig. Given a WIT schema, this
-project lets you write a Zig core module and have it wrapped into a
-real component (`.wasm` validated by `wasm-tools`), able to call into
-— and be called by — Rust hosts through the canonical ABI.
+WebAssembly Component Model support in Zig.
 
-The build pipeline mirrors what `cargo-component` does for Rust: a
-small code generator emits Zig source from WIT, the user's component
-compiles that to `wasm32-freestanding`, and `wasm-tools component
-embed` + `component new` turn the core module into a component.
+Given a WIT schema, this project lets you write a Zig core module.
+It wraps that module into a real component (`.wasm` validated by
+`wasm-tools`).
+The component can call Rust hosts through the canonical ABI.
+Rust hosts can call the component through the same ABI.
+
+The build pipeline mirrors `cargo-component` for Rust.
+A small code generator emits Zig source from WIT.
+The component compiles to `wasm32-freestanding`.
+Then `wasm-tools component embed` and `component new` turn the core
+module into a component.
 
 ## Documentation
 
 Full user-facing documentation lives in [`docs/`](docs/README.md).
+
 Start with [getting-started](docs/getting-started.md) for prerequisites
-and a runnable tour of the bundled demos, then [your first
-component](docs/workflow.md) for a step-by-step walkthrough of
-building your own.
+and a runnable tour of the bundled demos.
+Then read [your first component](docs/workflow.md) for a step-by-step
+walkthrough of building your own component.
 
 ## Quick start
 
@@ -42,7 +47,7 @@ cargo build --release --manifest-path examples/greeter/rust-host/Cargo.toml
   zig-out/wasm/greeter.component.wasm
 
 # Run the dual-language demo (one Rust host, two components built
-# from the same WIT — one in Zig, one with cargo-component):
+# from the same WIT, one in Zig and one with cargo-component):
 cargo build --release --manifest-path examples/dual/host/Cargo.toml
 (cd examples/dual/rust-impl && cargo component build --release)
 ./examples/dual/host/target/release/dual-host \
@@ -78,7 +83,7 @@ sum([1,2,3,4,5,100]) = 115
 manhattan(point { x: -3, y: 4 }) = 7
 format-greeting("world") = "Hi, world!"
 captured logs: ["hello Hello from Rust!"]
-OK — Rust ↔ Zig component interop (both directions) verified.
+OK: Rust ↔ Zig component interop is verified in both directions.
 ```
 
 ## Layout
@@ -120,7 +125,7 @@ examples/
   wasi-demo-p3/     The same tour against WASI 0.3.1 via the
                     `zig_wasi_components.wasi3` module: stream-based
                     stdio and file I/O, async clock sleeps, a
-                    `stream<directory-entry>` listing, DNS — plus a
+                    `stream<directory-entry>` listing, DNS, plus a
                     `wasi:http/service@0.3.1` guest that serves real
                     requests under `wasmtime serve` and makes an
                     outbound fetch through the 0.3 http client
@@ -129,7 +134,7 @@ examples/
 
 ## What works
 
-The parser ingests the full WIT surface used by real WASI 0.2.x /
+The parser ingests the full WIT surface used by real WASI 0.2.x and
 0.3.x packages:
 
 - packages with `ns:name@x.y.z[-suffix]` versions, file-scope `use`
@@ -151,32 +156,43 @@ The parser ingests the full WIT surface used by real WASI 0.2.x /
   interface twice under distinct names, each with its own generated
   namespace
 
-It has been validated against the published WIT files of the full
-`wasi:cli`, `wasi:io`, `wasi:clocks`, `wasi:random`, `wasi:sockets`,
-`wasi:filesystem` and `wasi:http` set at `0.2.12`, including the new
-`exit-with-code` call and the unstable `wasi:clocks/timezone`
-interface, and against the six final WASI `0.3.0` and `0.3.1`
-packages: every world in them generates bindings that compile, and
-components built from the generated `wasi:cli/command@0.3.1` and
-`wasi:http/service@0.3.1` bindings pass `wasm-tools component new`
-validation and run end to end under wasmtime 46+ (`wasmtime run
--S p3` for the command world, `wasmtime serve -S p3,cli` for the
-http service, outbound requests included — wasmtime links the 0.3.1
-imports against its 0.3.0 implementations through semver-compatible
-resolution).
-The stream/future canon intrinsics are generated for *every*
-function that traffics in `stream<T>` / `future<T>` — async or sync,
-top-level or resource method — with canonical-layout `lift`/`lower`
-helpers for compound payloads such as `directory-entry`, which is
-what makes the `wasi3` convenience layer (and the 0.3 stdio/fs/http
-APIs generally) usable from plain Zig.
+The project has been validated against the published WIT files for the
+full `wasi:cli`, `wasi:io`, `wasi:clocks`, `wasi:random`,
+`wasi:sockets`, `wasi:filesystem`, and `wasi:http` set at `0.2.12`.
+This includes the `exit-with-code` call and the unstable
+`wasi:clocks/timezone` interface.
 
-The codegen covers every WIT type listed in the table below in
-both directions, using the spec's canonical memory layout for
-indirect parameters and indirect returns, plus the obligatory
-`cabi_realloc` / `cabi_post_*` entry points (the latter named per
-wit-component's current convention so wasmtime actually wires it
-into each `canon lift`).
+It has also been validated against the six final WASI `0.3.0` and
+`0.3.1` packages.
+Every world in those packages generates bindings that compile.
+Components built from the generated `wasi:cli/command@0.3.1` and
+`wasi:http/service@0.3.1` bindings pass `wasm-tools component new`
+validation.
+They also run end to end under wasmtime 46+.
+
+Use `wasmtime run -S p3` for the command world.
+Use `wasmtime serve -S p3,cli` for the HTTP service.
+Outbound requests are included.
+Wasmtime links the 0.3.1 imports against its 0.3.0 implementations
+through semver-compatible resolution.
+
+The stream and future canon intrinsics are generated for every function
+that uses `stream<T>` or `future<T>`.
+This includes async and sync functions.
+It also includes top-level and resource methods.
+Canonical-layout `lift` and `lower` helpers support compound payloads,
+such as `directory-entry`.
+This support makes the `wasi3` convenience layer usable from plain Zig.
+It also supports the 0.3 stdio, filesystem, and HTTP APIs.
+
+The code generator covers every WIT type in the table below.
+It supports both directions.
+It uses the specification's canonical memory layout for indirect
+parameters and returns.
+It also emits the required `cabi_realloc` and `cabi_post_*` entry
+points.
+The latter uses wit-component's current convention.
+That naming lets wasmtime wire each function into `canon lift`.
 
 | WIT type                                  | covered                 | demo                                             |
 | ----------------------------------------- | ----------------------- | ------------------------------------------------ |
@@ -201,36 +217,46 @@ into each `canon lift`).
 
 ## What is still ahead
 
-The canonical-ABI surface that ships with WIT 0.2.x / 0.3.x is fully
-covered in both directions; the items below are corner cases that
-either depend on upstream movement or have no shipping consumer yet.
+The canonical ABI surface that ships with WIT 0.2.x and 0.3.x is fully
+covered in both directions.
+The items below are corner cases.
+They depend on upstream movement or lack a shipping consumer.
 
-- **`list<T, N>` as a variant case payload** is wired through the
-  ABI in every direction now (parameter, return type, record field,
-  top-level alias, *and* projected to a single flat slot inside a
-  variant arm). No WASIp2/p3 interface exercises the projection
-  path; if you build a custom WIT that does, file an issue with the
-  schema so we can add a real demo.
-- **Stream/future intrinsics for sync *exports*.** The
-  per-function intrinsics namespaces are generated for imports,
-  imported-resource methods, and async exports. A *sync* export
-  (or an exported resource method) whose signature mentions
-  `stream<T>` / `future<T>` does not get one yet — no WASI world
-  ships such a function, so there is no consumer to validate
-  against. The async export shapes themselves (eager fn form and
-  typed state-machine form) are fully supported; see
-  [docs/bindings.md](docs/bindings.md).
+- **`list<T, N>` as a variant case payload** is wired through the ABI
+  in every direction.
+  This includes parameters, return types, record fields, and top-level
+  aliases.
+  It also projects to a single flat slot inside a variant arm.
+  No WASIp2 or WASIp3 interface exercises the projection path.
+  If you build a custom WIT that does, file an issue with the schema.
+  We can then add a real demo.
+
+- **Stream/future intrinsics for sync *exports*.** The per-function
+  intrinsics namespaces are generated for imports, imported-resource
+  methods, and async exports.
+  A sync export or exported resource method may mention `stream<T>` or
+  `future<T>`.
+  It does not get an intrinsics namespace yet.
+  No WASI world ships such a function.
+  There is therefore no consumer to validate against.
+  The async export shapes are fully supported.
+  They include the eager function and typed state-machine forms.
+  See [docs/bindings.md](docs/bindings.md).
+
 - **HTTP request bodies in the `wasi3` blocking wrapper.** The 0.3
-  host only answers once the request body stream is dropped, but
-  the body can only be written while `client.send` is in flight —
-  a blocking helper cannot interleave the two. Sending a body
-  needs the state-machine async export form;
-  `wasi3.http.Request` deliberately has no `body` field so the gap
-  is a compile error.
-- **Flags with more than 32 labels.** The canonical-ABI spec caps
-  flags at 32 labels (`assert(0 < n <= 32)` in `CanonicalABI.md`).
-  We follow the spec and return `error.Unsupported` past that
-  boundary.
-- **Multi-named result tuples.** Removed from WIT upstream; the
-  parser rejects `func() -> (a: u32, b: string)` just like modern
-  `wasm-tools` does. Use a `record` return type.
+  host answers only after the request body stream is dropped.
+  The body can only be written while `client.send` is in flight.
+  A blocking helper cannot interleave those operations.
+  Sending a body needs the state-machine async export form.
+  `wasi3.http.Request` deliberately has no `body` field.
+  The missing field makes this gap a compile error.
+
+- **Flags with more than 32 labels.** The canonical-ABI specification
+  caps flags at 32 labels (`assert(0 < n <= 32)` in `CanonicalABI.md`).
+  We follow the specification.
+  We return `error.Unsupported` past that boundary.
+
+- **Multi-named result tuples.** WIT removed this form upstream.
+  The parser rejects `func() -> (a: u32, b: string)`.
+  Modern `wasm-tools` also rejects it.
+  Use a `record` return type.
