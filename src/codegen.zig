@@ -3058,6 +3058,24 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         }
     }
 
+    // The `use` aliases inside the emitted structs point at their
+    // source interface's struct. Emit a types-only struct for any
+    // source still missing, until the closure is complete.
+    var closed = false;
+    while (!closed) {
+        closed = true;
+        for (resolver.entries.items) |entry| {
+            if (!entry.is_use_alias) continue;
+            if (entry.source_iface_prefix.len == 0) continue;
+            if (!containsString(&emitted_structs, entry.iface_prefix)) continue;
+            if (containsString(&emitted_structs, entry.source_iface_prefix)) continue;
+            const owner = (try findInterfaceByPrefix(gpa, &pkg, entry.source_iface_prefix)) orelse continue;
+            try emitInterfaceTypesOnly(w, &resolver, entry.source_iface_prefix, owner.pkg.namespace, owner.pkg.name);
+            try emitted_structs.append(gpa, try gpa.dupe(u8, entry.source_iface_prefix));
+            closed = false;
+        }
+    }
+
     if (world_level_func_imports) {
         try w.writeAll(
             \\/// Functions the host must provide (world-level imports).
@@ -3185,13 +3203,36 @@ fn emitIfaceTypesBlock(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8)
     try w.writeAll("    };\n\n");
 }
 
+fn containsString(list: *const std.ArrayList([]u8), s: []const u8) bool {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, s)) return true;
+    }
+    return false;
+}
+
+/// Find the interface whose canonical Zig prefix is `prefix`, looking
+/// through the package and its deps.
+fn findInterfaceByPrefix(gpa: Allocator, pkg: *const wit.Package, prefix: []const u8) Allocator.Error!?InterfaceLookup {
+    for (pkg.interfaces) |*i| {
+        const p = try ifacePrefixAlloc(gpa, pkg.*, i.name);
+        defer gpa.free(p);
+        if (std.mem.eql(u8, p, prefix)) return .{ .pkg = pkg, .iface = i };
+    }
+    for (pkg.deps) |*d| {
+        for (d.interfaces) |*i| {
+            const p = try ifacePrefixAlloc(gpa, d.*, i.name);
+            defer gpa.free(p);
+            if (std.mem.eql(u8, p, prefix)) return .{ .pkg = d, .iface = i };
+        }
+    }
+    return null;
+}
+
 /// Emit a types-only struct for an exported interface, unless one
 /// already exists under `prefix` or the interface has no types.
 /// Appends the prefix to `emitted` when it writes something.
 fn maybeEmitTypesOnly(w: *std.Io.Writer, r: *Resolver, emitted: *std.ArrayList([]u8), prefix: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
-    for (emitted.items) |s| {
-        if (std.mem.eql(u8, s, prefix)) return;
-    }
+    if (containsString(emitted, prefix)) return;
     var has_types = false;
     for (r.entries.items) |entry| {
         if (std.mem.eql(u8, entry.iface_prefix, prefix)) {
@@ -4810,6 +4851,31 @@ test "export-only interfaces get a types struct and qualified refs" {
         try testing.expect(std.mem.indexOf(u8, src, "pub const demo_x_geo = struct {") != null);
         try testing.expect(std.mem.indexOf(u8, src, "demo_x_geo.types.point") != null);
         try testing.expect(std.mem.indexOf(u8, src, " types.point") == null);
+    }
+}
+
+test "use sources of emitted structs are emitted transitively" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package demo:x@0.1.0;
+        \\interface deps {
+        \\  record item { x: u32 }
+        \\}
+        \\interface api {
+        \\  use deps.{item};
+        \\  get: func() -> item;
+        \\}
+        \\world w1 { export api; }
+        \\world w2 { import client: api; }
+    );
+    for (pkg.worlds) |wld| {
+        const src = try generateWorld(testing.allocator, pkg, wld, .{});
+        defer testing.allocator.free(src);
+        // The alias references `demo_x_deps`, so that struct must
+        // exist even though `deps` is neither imported nor exported.
+        try testing.expect(std.mem.indexOf(u8, src, "= demo_x_deps.types.item;") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "pub const demo_x_deps = struct {") != null);
     }
 }
 
