@@ -321,11 +321,12 @@ pub fn Wasi(comptime b: type) type {
                         defer b.wasi_io_streams.resources.output_stream.drop(out_stream);
                         try blockingWriteAll(out_stream, req.body);
                     }
+                    // `finish` consumes the body even when it returns an error.
+                    body_consumed = true;
                     switch (wht.resources.outgoing_body.finish(out_body, null)) {
                         .ok => {},
                         .err => return error.BodyFailed,
                     }
-                    body_consumed = true;
                 }
 
                 const handle_res = wsh.handle(outgoing, null);

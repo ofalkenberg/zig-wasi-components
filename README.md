@@ -26,6 +26,9 @@ walkthrough of building your own component.
 ## Quick start
 
 ```bash
+zig build test            # native parser, codegen, and runtime unit tests
+zig build test-components # component regressions (Python 3, wasm-tools, wasmtime)
+
 zig build demo         # builds zig-out/wasm/greeter.component.wasm
 zig build dual         # builds zig-out/wasm/math.component.wasm
 zig build resource     # builds zig-out/wasm/counts.component.wasm
@@ -97,6 +100,10 @@ src/
   wasi3.zig     `Wasi3(bindings)` convenience layer for WASI 0.3
   wasi_common.zig  Pieces shared by both convenience layers
   main.zig      `zig-wit dump|gen` CLI
+tests/
+  components.py   Builds and runs component regressions in Debug and ReleaseSmall.
+  *.wit, *.zig    Fixtures for generated bindings and canonical ABI behavior.
+  README.md       Reproduced failures, validation commands, and coverage limits.
 examples/
   greeter/          Records, lists, variants, options, results, tuples,
                     flags, char, indirect params/results.

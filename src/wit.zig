@@ -334,7 +334,7 @@ const Tokenizer = struct {
         self.doc_buf.deinit(self.gpa);
     }
 
-    fn skipTrivia(self: *Tokenizer) Allocator.Error!void {
+    fn skipTrivia(self: *Tokenizer) Error!void {
         while (self.pos < self.src.len) {
             const c = self.src[self.pos];
             if (ascii.isWhitespace(c)) {
@@ -371,7 +371,7 @@ const Tokenizer = struct {
                             self.pos += 1;
                         }
                     }
-                    if (depth > 0) self.pos = self.src.len;
+                    if (depth > 0) return Error.UnexpectedEof;
                     continue;
                 }
             }
@@ -388,7 +388,7 @@ const Tokenizer = struct {
         self.doc_buf.clearRetainingCapacity();
     }
 
-    fn nextIdent(self: *Tokenizer) Allocator.Error!?[]const u8 {
+    fn nextIdent(self: *Tokenizer) Error!?[]const u8 {
         try self.skipTrivia();
         const start = self.pos;
         if (self.pos < self.src.len and self.src[self.pos] == '%') {
@@ -415,7 +415,7 @@ const Tokenizer = struct {
         return id;
     }
 
-    fn consume(self: *Tokenizer, lit: []const u8) Allocator.Error!bool {
+    fn consume(self: *Tokenizer, lit: []const u8) Error!bool {
         try self.skipTrivia();
         if (self.pos + lit.len > self.src.len) return false;
         if (!mem.eql(u8, self.src[self.pos .. self.pos + lit.len], lit)) return false;
@@ -423,7 +423,7 @@ const Tokenizer = struct {
         return true;
     }
 
-    fn consumeWord(self: *Tokenizer, lit: []const u8) Allocator.Error!bool {
+    fn consumeWord(self: *Tokenizer, lit: []const u8) Error!bool {
         const save = self.pos;
         try self.skipTrivia();
         if (self.pos + lit.len > self.src.len) return false;
@@ -743,7 +743,7 @@ const Parser = struct {
         return out;
     }
 
-    fn peekTypeKeyword(self: *Parser) Allocator.Error!bool {
+    fn peekTypeKeyword(self: *Parser) Error!bool {
         const save = self.tok.pos;
         defer self.tok.pos = save;
         try self.tok.skipTrivia();
@@ -1807,6 +1807,18 @@ test "block comments nest" {
         \\interface i { f: func(); }
     );
     try testing.expectEqual(@as(usize, 1), pkg.interfaces.len);
+}
+
+test "unterminated block comments are rejected even after a complete package" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{
+        "/*",
+        "package demo:x; /*",
+        "package demo:x; world w {} /* outer /* inner */",
+        "package demo:x; world w {} /* outer /* inner */ trailing",
+    }) |src| try testing.expectError(Error.UnexpectedEof, parse(arena.allocator(), src));
+    _ = try parse(arena.allocator(), "package demo:x; world w {} /* outer /* inner */ closed */");
 }
 
 test "identifiers must be kebab-case" {

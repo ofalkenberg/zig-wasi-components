@@ -221,6 +221,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const component_tests = b.addSystemCommand(&.{"python3"});
+    component_tests.addFileArg(b.path("tests/components.py"));
+    component_tests.addArg("--generator");
+    component_tests.addArtifactArg(exe);
+    component_tests.addArg("--repo");
+    component_tests.addDirectoryArg(b.path("."));
+    component_tests.has_side_effects = true;
+    const component_test_step = b.step("test-components", "Compile and run canonical ABI regressions (wasm-tools, wasmtime, Python 3)");
+    component_test_step.dependOn(&component_tests.step);
+
     // ----- demo: build the greeter component end-to-end -----
     //
     // 1. Run the codegen exe to produce `bindings.zig` from `greeter.wit`.

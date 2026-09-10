@@ -35,7 +35,7 @@ pub const CallbackCode = enum(u32) {
     wait = 2,
 
     pub fn pack(code: CallbackCode, waitable_set_index: u32) u32 {
-        return @intFromEnum(code) | (waitable_set_index << 4);
+        return @backingInt(code) | (waitable_set_index << 4);
     }
 };
 
@@ -61,7 +61,7 @@ pub const SubtaskResult = struct {
 
     pub fn unpack(packed_value: u32) SubtaskResult {
         return .{
-            .status = @enumFromInt(packed_value & 0xF),
+            .status = @fromBackingInt(@intCast(packed_value & 0xF)),
             .subtask = packed_value >> 4,
         };
     }
@@ -74,7 +74,7 @@ pub const CopyOutcome = union(enum) {
     pub fn unpack(packed_value: u32) CopyOutcome {
         if (packed_value == BLOCKED) return .blocked;
         return .{ .done = .{
-            .result = @enumFromInt(packed_value & 0xF),
+            .result = @fromBackingInt(@intCast(packed_value & 0xF)),
             .progress = packed_value >> 4,
         } };
     }
@@ -124,6 +124,12 @@ pub const Realloc = struct {
     }
 
     pub fn realloc(self: *Realloc, old_ptr: ?*anyopaque, old_size: usize, alignment: u32, new_size: usize) ?*anyopaque {
+        std.debug.assert(alignment != 0);
+        // Empty lists and strings still call realloc, but Zig's raw
+        // allocator needs a positive size. Return the alignment as the
+        // dangling pointer, which is what emitLowerListExpr uses for an
+        // empty list. Old storage waits for the arena reset.
+        if (new_size == 0) return @ptrFromInt(alignment);
         const a = self.arena.allocator();
         if (old_ptr == null) {
             const buf = a.rawAlloc(new_size, std.mem.Alignment.fromByteUnits(alignment), @returnAddress()) orelse return null;
@@ -140,6 +146,18 @@ pub const Realloc = struct {
         _ = self.arena.reset(.retain_capacity);
     }
 };
+
+test "canonical realloc accepts zero-size allocations and shrinking to zero" {
+    var state: Realloc = .init(std.testing.allocator);
+    defer state.arena.deinit();
+    for ([_]u32{ 1, 2, 4, 8 }) |alignment| {
+        const empty = state.realloc(null, 0, alignment, 0).?;
+        try std.testing.expectEqual(0, @intFromPtr(empty) % alignment);
+        const allocated = state.realloc(null, 0, alignment, 32).?;
+        const shrunk = state.realloc(allocated, 32, alignment, 0).?;
+        try std.testing.expectEqual(0, @intFromPtr(shrunk) % alignment);
+    }
+}
 
 /// Imports from the `$root` module that every async-using component sees.
 /// These are wired by wit-component as canonical built-ins and are NOT
@@ -442,13 +460,13 @@ pub const WaitableSet = struct {
         // u32s before returning (or traps), so we can leave the slots
         // undefined — no need to zero-fill.
         var payload: [2]u32 = undefined;
-        const code: Event = @enumFromInt(root_async.@"[waitable-set-wait]"(self.handle, @intCast(@intFromPtr(&payload))));
+        const code: Event = @fromBackingInt(@intCast(root_async.@"[waitable-set-wait]"(self.handle, @intCast(@intFromPtr(&payload)))));
         return .{ .code = code, .p1 = payload[0], .p2 = payload[1] };
     }
 
     pub fn poll(self: WaitableSet) Notification {
         var payload: [2]u32 = undefined;
-        const code: Event = @enumFromInt(root_async.@"[waitable-set-poll]"(self.handle, @intCast(@intFromPtr(&payload))));
+        const code: Event = @fromBackingInt(@intCast(root_async.@"[waitable-set-poll]"(self.handle, @intCast(@intFromPtr(&payload)))));
         return .{ .code = code, .p1 = payload[0], .p2 = payload[1] };
     }
 };
@@ -477,7 +495,7 @@ pub fn liftChar(v: u32) u21 {
 /// values instead of invoking undefined behavior.
 pub fn liftEnum(comptime E: type, v: u32) E {
     if (v >= @typeInfo(E).@"enum".field_names.len) trap();
-    return @enumFromInt(v);
+    return @fromBackingInt(@intCast(v));
 }
 
 pub const StreamCopyError = error{
@@ -590,12 +608,12 @@ pub fn FutureDelivery(comptime ns: type) type {
             if (self.pending) {
                 const set = WaitableSet.init();
                 defer set.deinit();
-                set.join(@intFromEnum(self.writable));
+                set.join(@backingInt(self.writable));
                 while (true) {
                     const n = set.wait();
-                    if (n.code == .future_write and n.p1 == @intFromEnum(self.writable)) break;
+                    if (n.code == .future_write and n.p1 == @backingInt(self.writable)) break;
                 }
-                WaitableSet.leave(@intFromEnum(self.writable));
+                WaitableSet.leave(@backingInt(self.writable));
                 self.pending = false;
             }
             ns.dropWritable(self.writable);
@@ -633,7 +651,7 @@ pub fn FutureDelivery(comptime ns: type) type {
             self.disposed = true;
             if (self.pending) {
                 self.pending = false;
-                WaitableSet.leave(@intFromEnum(self.writable));
+                WaitableSet.leave(@backingInt(self.writable));
             }
             ns.dropWritable(self.writable);
         }
@@ -644,11 +662,31 @@ pub fn FutureDelivery(comptime ns: type) type {
 /// the canonical element layout, or null if the writable end was
 /// dropped without a value.
 pub fn futureAwait(comptime ns: type, handle: Future) ?ns.T {
-    var buf: [ns.elem_size]u8 align(ns.elem_align) = undefined;
-    return switch (ns.readRaw(handle, @intFromPtr(&buf))) {
-        .blocked => null,
-        .done => |d| if (d.result == .completed) ns.lift(@intFromPtr(&buf)) else null,
+    const has_payload = @hasDecl(ns, "elem_size");
+    const buf_size = if (has_payload) ns.elem_size else 0;
+    const buf_align = if (has_payload) ns.elem_align else 1;
+    var buf: [buf_size]u8 align(buf_align) = undefined;
+    switch (ns.readRaw(handle, @intFromPtr(&buf))) {
+        .blocked => return null,
+        .done => |d| {
+            if (d.result != .completed) return null;
+            return if (has_payload) ns.lift(@intFromPtr(&buf)) else {};
+        },
+    }
+}
+
+test "futureAwait supports futures without a payload" {
+    const ns = struct {
+        pub const T = void;
+        pub var outcome: CopyOutcome = .{ .done = .{ .result = .completed, .progress = 0 } };
+
+        pub fn readRaw(_: Future, _: usize) CopyOutcome {
+            return outcome;
+        }
     };
+    try std.testing.expect(futureAwait(ns, @fromBackingInt(@intCast(1))) != null);
+    ns.outcome = .{ .done = .{ .result = .cancelled, .progress = 0 } };
+    try std.testing.expect(futureAwait(ns, @fromBackingInt(@intCast(1))) == null);
 }
 
 /// Drop the readable + writable ends of a stream/future. Drop the handle

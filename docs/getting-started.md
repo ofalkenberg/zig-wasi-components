@@ -9,7 +9,7 @@ You can then continue to [your first component](workflow.md).
 
 ## What you need
 
-- **Zig 0.17.0-dev** (specifically `0.17.0-dev.639+284ab0ad8` or newer).
+- **Zig 0.17.0-dev** (specifically `0.17.0-dev.2119+1bc892110` or newer).
   The project tracks Zig master.
   It uses the new `Io` namespace, unmanaged `ArrayList`, and `std.process.Init`.
   An older compiler cannot parse `src/main.zig`.
@@ -55,6 +55,18 @@ Resource methods with more than 16 flat parameters are covered too.
 
 A parser failure often means an upstream WIT grammar addition needs porting.
 Check the WASIp3 specification.
+
+To compile and run the component regressions too, put Python 3, `wasm-tools`,
+and `wasmtime` on PATH and run:
+
+```sh
+zig build test-components
+```
+
+This runs the fixtures in `tests/` in Debug and ReleaseSmall. It checks
+generated bindings, component validation, and runtime values across component
+boundaries. See [the regression notes](../tests/README.md) for the reproduced
+failures and coverage limits.
 
 ## Build the bundled examples
 
