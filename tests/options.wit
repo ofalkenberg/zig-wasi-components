@@ -1,0 +1,38 @@
+package test:options;
+interface api {
+  type maybe = option<u32>;
+  type nested = option<maybe>;
+  type deep = option<option<nested>>;
+  type complex = option<option<result<u32, string>>>;
+  type outcomes = list<result<u32, string>>;
+  record value { before: u8, field: nested, after: u64 }
+  variant choice { empty, wrap(nested) }
+  type fixed = list<nested, 3>;
+  type many = tuple<nested, nested, nested, nested, nested, nested>;
+  echo: func(x: nested) -> nested;
+  echo-deep: func(x: deep) -> deep;
+  echo-complex: func(x: complex) -> complex;
+  echo-list: func(x: list<nested>) -> list<nested>;
+  echo-outcomes: func(x: outcomes) -> outcomes;
+  echo-complex-list: func(x: list<complex>) -> list<complex>;
+  echo-value: func(x: value) -> value;
+  echo-choice: func(x: choice) -> choice;
+  echo-many: func(x: many) -> many;
+  echo-fixed: func(x: fixed) -> fixed;
+  inspect: async func(x: future<nested>) -> bool;
+}
+world provider { export api; }
+world demo {
+  import api;
+  use api.{nested, deep, complex, outcomes, value, choice, many};
+  export echo: func(x: nested) -> nested;
+  export echo-deep: func(x: deep) -> deep;
+  export echo-complex: func(x: complex) -> complex;
+  export echo-list: func(x: list<nested>) -> list<nested>;
+  export echo-outcomes: func(x: outcomes) -> outcomes;
+  export echo-complex-list: func(x: list<complex>) -> list<complex>;
+  export echo-value: func(x: value) -> value;
+  export echo-choice: func(x: choice) -> choice;
+  export echo-many: func(x: many) -> many;
+  export run: async func() -> bool;
+}

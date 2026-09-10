@@ -1,0 +1,10 @@
+package test:async-types;
+
+interface api {
+  type numbers = stream<u32>;
+  nested: async func() -> stream<future<u64>>;
+  repeated: async func(a: numbers, b: numbers) -> stream<u64>;
+  signal: async func(x: future) -> bool;
+}
+world provider { export api; }
+world demo { import api; export run: async func() -> bool; }

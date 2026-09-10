@@ -1,0 +1,18 @@
+package test:identifiers;
+
+interface host {
+  record point { %align: u32, %volatile: u32 }
+  // A kebab name becomes a snake name, which can still hit a Zig C-ABI
+  // primitive. These must stay escaped in both directions.
+  record c-int { c-long: u32, c-char: u32 }
+  %switch: func(%type: point) -> point;
+  widen: func(v: c-int) -> c-int;
+  c-long: func() -> list<u32>;
+}
+
+world provider { export host; }
+world demo {
+  import host;
+  export %switch: func(p0: u32, %type: option<u32>) -> option<u32>;
+  export run: func() -> u32;
+}

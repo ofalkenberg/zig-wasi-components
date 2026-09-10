@@ -1,0 +1,18 @@
+package test:resources;
+
+interface a {
+  resource item {
+    constructor(p0: u32);
+    get: func() -> u32;
+  }
+  drops: func() -> u32;
+}
+interface b {
+  resource item {
+    constructor(p0: u64);
+    get: func() -> u64;
+  }
+  drops: func() -> u32;
+}
+world provider { export a; export b; }
+world demo { import a; import b; export run: func() -> u64; }

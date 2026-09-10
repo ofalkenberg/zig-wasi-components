@@ -1,0 +1,50 @@
+package test:scopes;
+
+interface first {
+  enum kind { small, large }
+  record item { value: u8, kind: kind }
+  echo: func(item: item) -> item;
+}
+
+interface second {
+  enum kind { small, medium, large }
+  record item { value: u64, kind: kind }
+  echo: func(item: item) -> item;
+}
+
+interface shared {
+  enum kind { small, large }
+  type word = u64;
+  record value { prefix: u8, x: word, kind: kind }
+}
+
+interface middle {
+  use shared.{value as intermediate};
+}
+
+interface api {
+  use middle.{intermediate as value};
+  // These names must not change the imported record's ABI layout.
+  enum kind { wrong }
+  type word = u8;
+  echo: func(x: option<value>) -> option<value>;
+  echo-list: func(x: list<value>) -> list<value>;
+}
+
+world included {
+  use middle.{intermediate as top};
+  export top-echo: func(x: top) -> top;
+}
+
+world demo {
+  include included;
+  export first;
+  export renamed: second;
+  export api;
+  export inline-api: interface {
+    use middle.{intermediate as renamed};
+    record local { x: u64 }
+    echo: func(x: renamed) -> renamed;
+    local-echo: func(x: local) -> local;
+  }
+}
