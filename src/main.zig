@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    var stdout_w: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buf);
     const out = &stdout_w.interface;
     defer out.flush() catch {};
 
@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
             \\  {0s} dump <wit-file>           describe a WIT file
             \\  {0s} gen  <wit-file> <world>   emit Zig bindings to stdout
             \\
-        , .{args[0]});
+        , .{if (args.len > 0) args[0] else "zig-wit"});
         return;
     }
 
@@ -36,8 +36,8 @@ pub fn main(init: std.process.Init) !void {
         try out.print("package {s}:{s}", .{ pkg.namespace, pkg.name });
         if (pkg.version) |v| try out.print("@{s}", .{v.text});
         try out.print("\n", .{});
-        try out.print("  {d} world(s), {d} interface(s), {d} type(s), {d} dep(s)\n", .{
-            pkg.worlds.len, pkg.interfaces.len, pkg.types.len, pkg.deps.len,
+        try out.print("  {d} world(s), {d} interface(s), {d} dep(s)\n", .{
+            pkg.worlds.len, pkg.interfaces.len, pkg.deps.len,
         });
         for (pkg.worlds) |wld| {
             try out.print("  world {s}:\n", .{wld.name});
@@ -50,8 +50,8 @@ pub fn main(init: std.process.Init) !void {
         for (pkg.deps) |d| {
             try out.print("  dep {s}:{s}", .{ d.namespace, d.name });
             if (d.version) |v| try out.print("@{s}", .{v.text});
-            try out.print(" — {d} world(s), {d} interface(s), {d} type(s)\n", .{
-                d.worlds.len, d.interfaces.len, d.types.len,
+            try out.print(" - {d} world(s), {d} interface(s)\n", .{
+                d.worlds.len, d.interfaces.len,
             });
             for (d.interfaces) |i| try out.print("    interface {s} (resources: {d}, funcs: {d})\n", .{
                 i.name,
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
             }
 
             var err_buf: [4096]u8 = undefined;
-            var err_w: Io.File.Writer = .init(.stderr(), io, &err_buf);
+            var err_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
             const err = &err_w.interface;
             defer err.flush() catch {};
 

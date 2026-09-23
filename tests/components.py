@@ -94,6 +94,38 @@ class Pair:
         return linked
 
 
+class Chain(Pair):
+    """Exercise exports that receive another component's resource handles."""
+
+    def __init__(self, repo, generator, work, name):
+        super().__init__(repo, generator, work, name)
+        wit = repo / "tests" / f"{name}.wit"
+        self.middle = World(repo, generator, work, f"{name}-middle", "middle", wit)
+
+    def link(self, mode):
+        guest = self.guest.build(mode)
+        config = self.work / f"{self.name}-{mode}.yml"
+        config.write_text(
+            "instantiations:\n"
+            "  root:\n"
+            "    arguments:\n"
+            f"      test:{self.name}/i: provider\n"
+            f"      test:{self.name}/user: middle\n"
+            "  middle:\n"
+            "    dependency: middle\n"
+            "    arguments:\n"
+            f"      test:{self.name}/i: provider\n"
+            "  provider:\n"
+            "    dependency: provider\n"
+            "dependencies:\n"
+            f"  middle: {self.middle.build(mode)}\n"
+            f"  provider: {self.provider.build(mode)}\n"
+        )
+        linked = self.work / f"{self.name}-linked-{mode}.wasm"
+        run("wasm-tools", "compose", guest, "-c", config, "-o", linked)
+        return linked
+
+
 SCOPE_VALUE = "{prefix: 7, x: 4294967297, kind: large}"
 
 SCOPE_CALLS = (
@@ -107,6 +139,9 @@ SCOPE_CALLS = (
     (f"inline-api.echo({SCOPE_VALUE})", SCOPE_VALUE),
     ("inline-api.local-echo({x: 4294967297})", "{x: 4294967297}"),
 )
+
+# The last two values count destructor calls to verify ownership.
+BORROWS_RUN = "[4, 22, 20, 7, 20, 9, 124, 20, 11, 26, 21, 1300, 300, 1, 2]"
 
 IDENTIFIER_CALLS = (
     ("run()", "2062"),
@@ -144,8 +179,9 @@ def main():
         identifiers = Pair(repo, generator, work, "identifiers")
         # A world `use` declaration retains structural type imports.
         options = Pair(repo, generator, work, "options", no_imports=False)
-        simple = [Pair(repo, generator, work, name) for name in ("resources", "async-types")]
-        expected_run = {"resources": "4294967314", "async-types": "true"}
+        simple = [Pair(repo, generator, work, name) for name in ("resources", "async-types", "shadowing")]
+        borrows = Chain(repo, generator, work, "borrows")
+        expected_run = {"resources": "4294967314", "async-types": "true", "shadowing": "54321"}
 
         for mode in MODES:
             component = scopes.build(mode)
@@ -161,6 +197,9 @@ def main():
             for pair in simple:
                 invoke(pair.link(mode), "run()", expected_run[pair.name])
                 print(f"{mode}: {pair.name} run across component boundaries", flush=True)
+
+            invoke(borrows.link(mode), "run()", BORROWS_RUN)
+            print(f"{mode}: borrowed and owned handles cross export thunks", flush=True)
 
             linked = options.link(mode)
             invoke(linked, "run()", "true")

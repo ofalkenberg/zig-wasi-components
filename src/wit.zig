@@ -273,9 +273,6 @@ pub const Package = struct {
     version: ?Version,
     worlds: []const World,
     interfaces: []const Interface,
-    /// File-scope type definitions (rare but legal — wasi packages
-    /// keep all their types inside interfaces).
-    types: []const TypeDef,
     /// File-scope `use` statements.
     uses: []const Use,
     /// Sub-packages declared in block-`package` form. `wasm-tools
@@ -288,20 +285,23 @@ pub const Package = struct {
 // Tokenizer
 // =====================================================================
 
-/// WIT identifiers are kebab-case: hyphen-separated words, each either
-/// `[a-z][a-z0-9]*` or `[A-Z][A-Z0-9]*` (a `%` escape prefix, stripped
-/// by the tokenizer, does not change the shape rule).
 fn isValidLabel(id: []const u8) bool {
+    if (id.len == 0 or !ascii.isAlphabetic(id[0])) return false;
     var words = mem.splitScalar(u8, id, '-');
     while (words.next()) |word| {
         if (word.len == 0) return false;
-        const upper = ascii.isUpper(word[0]);
-        if (!upper and !ascii.isLower(word[0])) return false;
-        for (word[1..]) |c| {
-            if (ascii.isDigit(c)) continue;
-            if (upper and !ascii.isUpper(c)) return false;
-            if (!upper and !ascii.isLower(c)) return false;
+        var has_lower = false;
+        var has_upper = false;
+        for (word) |c| {
+            if (ascii.isLower(c)) {
+                has_lower = true;
+            } else if (ascii.isUpper(c)) {
+                has_upper = true;
+            } else if (!ascii.isDigit(c)) {
+                return false;
+            }
         }
+        if (has_lower and has_upper) return false;
     }
     return true;
 }
@@ -420,6 +420,8 @@ const Tokenizer = struct {
         if (self.pos + lit.len > self.src.len) return false;
         if (!mem.eql(u8, self.src[self.pos .. self.pos + lit.len], lit)) return false;
         self.pos += lit.len;
+        // Keep stray comments from attaching to the next declaration.
+        if (mem.eql(u8, lit, "}") or mem.eql(u8, lit, ";")) self.clearDocs();
         return true;
     }
 
@@ -534,7 +536,6 @@ const Parser = struct {
 
     worlds: std.ArrayList(World) = .empty,
     interfaces: std.ArrayList(Interface) = .empty,
-    types: std.ArrayList(TypeDef) = .empty,
     uses: std.ArrayList(Use) = .empty,
     deps: std.ArrayList(Package) = .empty,
 
@@ -561,16 +562,12 @@ const Parser = struct {
             .version = self.pkg_version,
             .worlds = try self.worlds.toOwnedSlice(self.gpa),
             .interfaces = try self.interfaces.toOwnedSlice(self.gpa),
-            .types = try self.types.toOwnedSlice(self.gpa),
             .uses = try self.uses.toOwnedSlice(self.gpa),
             .deps = try self.deps.toOwnedSlice(self.gpa),
         };
     }
 
-    /// Parse worlds/interfaces/types/uses. When `expect_brace_close` is
-    /// true, stop on `}`; otherwise stop on EOF. Encountering a
-    /// `package X@v { ... }` block descends into a sub-package and
-    /// appends it to `self.deps`.
+    /// Resolved WIT can include dependencies as package blocks.
     fn parsePackageBody(self: *Parser, expect_brace_close: bool) Error!void {
         while (true) {
             try self.tok.skipTrivia();
@@ -605,11 +602,6 @@ const Parser = struct {
                 try self.parseInterface(docs, gate);
                 continue;
             }
-            if (try self.peekTypeKeyword()) {
-                const td = try self.parseTypeDef(docs, gate);
-                try self.types.append(self.gpa, td);
-                continue;
-            }
             return Error.UnexpectedToken;
         }
     }
@@ -628,7 +620,6 @@ const Parser = struct {
 
         const saved_worlds = self.worlds;
         const saved_interfaces = self.interfaces;
-        const saved_types = self.types;
         const saved_uses = self.uses;
         const saved_ns = self.pkg_namespace;
         const saved_pkg_name = self.pkg_name;
@@ -636,7 +627,6 @@ const Parser = struct {
 
         self.worlds = .empty;
         self.interfaces = .empty;
-        self.types = .empty;
         self.uses = .empty;
         self.pkg_namespace = ns;
         self.pkg_name = name;
@@ -650,13 +640,11 @@ const Parser = struct {
             .version = version,
             .worlds = try self.worlds.toOwnedSlice(self.gpa),
             .interfaces = try self.interfaces.toOwnedSlice(self.gpa),
-            .types = try self.types.toOwnedSlice(self.gpa),
             .uses = try self.uses.toOwnedSlice(self.gpa),
         };
 
         self.worlds = saved_worlds;
         self.interfaces = saved_interfaces;
-        self.types = saved_types;
         self.uses = saved_uses;
         self.pkg_namespace = saved_ns;
         self.pkg_name = saved_pkg_name;
@@ -699,8 +687,31 @@ const Parser = struct {
                 idx += 1;
             }
         }
-        if (idx < text.len and text[idx] != '-' and text[idx] != '+') return Error.InvalidVersion;
+        // Semver leaves numeric prerelease identifiers unbounded;
+        // std.SemanticVersion limits them to usize.
+        if (idx < text.len) {
+            const suffix = text[idx..];
+            const build_start = mem.findScalar(u8, suffix, '+') orelse suffix.len;
+            if (suffix[0] == '-') {
+                try validateSemverIdentifiers(suffix[1..build_start], .pre_release);
+            } else if (build_start != 0) {
+                return Error.InvalidVersion;
+            }
+            if (build_start < suffix.len) try validateSemverIdentifiers(suffix[build_start + 1 ..], .build);
+        }
         return .{ .major = nums[0], .minor = nums[1], .patch = nums[2], .text = text };
+    }
+
+    /// parseVersion has already restricted the character set.
+    fn validateSemverIdentifiers(list: []const u8, kind: enum { pre_release, build }) Error!void {
+        var ids = mem.splitScalar(u8, list, '.');
+        while (ids.next()) |id| {
+            if (id.len == 0 or mem.findScalar(u8, id, '+') != null) return Error.InvalidVersion;
+            const numeric = for (id) |c| {
+                if (!ascii.isDigit(c)) break false;
+            } else true;
+            if (kind == .pre_release and numeric and id.len > 1 and id[0] == '0') return Error.InvalidVersion;
+        }
     }
 
     /// Parse a (possibly-zero) sequence of `@since(...)` / `@unstable(...)` /
@@ -1305,10 +1316,8 @@ const Parser = struct {
         if (try self.tok.consumeWord("tuple")) {
             try self.tok.expect("<");
             var elems: std.ArrayList(TypeRef) = .empty;
-            while (true) {
-                const t = try self.parseTypeExpr();
-                try elems.append(self.gpa, t);
-                try self.tok.skipTrivia();
+            while (!try self.tok.consume(">")) {
+                try elems.append(self.gpa, try self.parseTypeExpr());
                 if (try self.tok.consume(",")) continue;
                 try self.tok.expect(">");
                 break;
@@ -1431,25 +1440,25 @@ test "parse record / variant / list / option / result" {
     defer arena.deinit();
     const pkg = try parse(arena.allocator(),
         \\package demo:app@1.0.0;
-        \\record user { id: u32, name: string, age: u32, }
-        \\variant outcome { ok-case, failed(string) }
-        \\enum color { red, green, blue }
-        \\flags perms { read, write, exec }
         \\world w {
+        \\  record user { id: u32, name: string, age: u32, }
+        \\  variant outcome { ok-case, failed(string) }
+        \\  enum color { red, green, blue }
+        \\  flags perms { read, write, exec }
         \\  export greet: func(u: user) -> string;
         \\  export users: func() -> list<user>;
         \\  export find: func(id: u32) -> option<user>;
         \\  export validate: func(name: string) -> result<user, string>;
         \\}
     );
-    try testing.expectEqual(@as(usize, 4), pkg.types.len);
-    try testing.expect(pkg.types[0].body == .record);
-    try testing.expectEqual(@as(usize, 3), pkg.types[0].body.record.len);
-    try testing.expect(pkg.types[1].body == .variant);
-    try testing.expect(pkg.types[1].body.variant[1].ty != null);
-    try testing.expectEqual(@as(usize, 3), pkg.types[2].body.@"enum".len);
-    try testing.expectEqual(@as(usize, 3), pkg.types[3].body.flags.len);
     const w = pkg.worlds[0];
+    try testing.expectEqual(@as(usize, 4), w.types.len);
+    try testing.expect(w.types[0].body == .record);
+    try testing.expectEqual(@as(usize, 3), w.types[0].body.record.len);
+    try testing.expect(w.types[1].body == .variant);
+    try testing.expect(w.types[1].body.variant[1].ty != null);
+    try testing.expectEqual(@as(usize, 3), w.types[2].body.@"enum".len);
+    try testing.expectEqual(@as(usize, 3), w.types[3].body.flags.len);
     try testing.expectEqual(@as(usize, 4), w.externs.len);
     try testing.expect(w.externs[2].body.func.results[0].ty.kind == .option);
     const rr = w.externs[3].body.func.results[0].ty.kind.result;
@@ -1918,4 +1927,66 @@ test "type nesting depth is bounded" {
     for (0..depth) |_| try src.append(gpa, '>');
     try src.appendSlice(gpa, ";\n}\n");
     try testing.expectError(Error.NestingTooDeep, parse(gpa, src.items));
+}
+
+test "tuple lists accept a trailing comma and may be empty" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  type t = tuple<u32, u64,>;
+        \\  type e = tuple<>;
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), pkg.interfaces[0].types[0].body.alias.kind.tuple.len);
+    try testing.expectEqual(@as(usize, 0), pkg.interfaces[0].types[1].body.alias.kind.tuple.len);
+}
+
+test "only the first label fragment must start with a letter" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try parse(arena.allocator(), "package a:b; interface i { record point-3d { x: u32 } sha-256: func(); a-1B: func(); }");
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(), "package a:b; interface i { 3d: func(); }"));
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(), "package a:b; interface i { a-Bc: func(); }"));
+}
+
+test "stray doc comments don't attach to the next declaration" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try parse(arena.allocator(),
+        \\package a:b;
+        \\interface i {
+        \\  first: func(
+        \\    a: u32,
+        \\    /// stray
+        \\  );
+        \\  /// Doc for second.
+        \\  second: func();
+        \\  /// dangling
+        \\}
+        \\/// Doc for j.
+        \\@since(version = 0.1.0)
+        \\interface j {}
+    );
+    try testing.expectEqualStrings("Doc for second.\n", pkg.interfaces[0].funcs[1].docs);
+    try testing.expectEqualStrings("Doc for j.\n", pkg.interfaces[1].docs);
+}
+
+test "semver suffixes are validated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try parse(a, "package a:b@1.0.0-rc.1+build.01;");
+    _ = try parse(a, "package a:b@1.0.0-18446744073709551616;");
+    for ([_][]const u8{ "1.0.0-", "1.0.0-01", "1.0.0+", "1.0.0+a+b", "1.0.0-18446744073709551616.01" }) |ver| {
+        const src = try std.fmt.allocPrint(a, "package a:b@{s};", .{ver});
+        try testing.expectError(Error.InvalidVersion, parse(a, src));
+    }
+}
+
+test "types are not allowed at package scope" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(Error.UnexpectedToken, parse(arena.allocator(), "package a:b; record r { x: u32 }"));
 }

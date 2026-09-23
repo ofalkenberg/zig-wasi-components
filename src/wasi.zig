@@ -305,29 +305,17 @@ pub fn Wasi(comptime b: type) type {
                     .err => return error.SetSchemeFailed,
                 }
 
-                if (req.body.len != 0) {
-                    const out_body = switch (wht.resources.outgoing_request.body(outgoing)) {
+                // Send the request before writing its body so the host can
+                // drain its buffer while we write.
+                const out_body: ?wht.types.outgoing_body = if (req.body.len != 0)
+                    switch (wht.resources.outgoing_request.body(outgoing)) {
                         .ok => |body_h| body_h,
                         .err => return error.BodyFailed,
-                    };
-                    var body_consumed = false;
-                    errdefer if (!body_consumed) wht.resources.outgoing_body.drop(out_body);
-
-                    {
-                        const out_stream = switch (wht.resources.outgoing_body.write(out_body)) {
-                            .ok => |s| s,
-                            .err => return error.BodyFailed,
-                        };
-                        defer b.wasi_io_streams.resources.output_stream.drop(out_stream);
-                        try blockingWriteAll(out_stream, req.body);
                     }
-                    // `finish` consumes the body even when it returns an error.
-                    body_consumed = true;
-                    switch (wht.resources.outgoing_body.finish(out_body, null)) {
-                        .ok => {},
-                        .err => return error.BodyFailed,
-                    }
-                }
+                else
+                    null;
+                var body_consumed = false;
+                errdefer if (!body_consumed) if (out_body) |ob| wht.resources.outgoing_body.drop(ob);
 
                 const handle_res = wsh.handle(outgoing, null);
                 consumed = true;
@@ -336,6 +324,24 @@ pub fn Wasi(comptime b: type) type {
                     .err => return error.HandleFailed,
                 };
                 defer wht.resources.future_incoming_response.drop(future);
+
+                if (out_body) |ob| {
+                    {
+                        const out_stream = switch (wht.resources.outgoing_body.write(ob)) {
+                            .ok => |s| s,
+                            .err => return error.BodyFailed,
+                        };
+                        defer b.wasi_io_streams.resources.output_stream.drop(out_stream);
+                        // An early request failure can close the body stream.
+                        blockingWriteAll(out_stream, req.body) catch return error.BodyFailed;
+                    }
+                    // `finish` consumes the body even when it returns an error.
+                    body_consumed = true;
+                    switch (wht.resources.outgoing_body.finish(ob, null)) {
+                        .ok => {},
+                        .err => return error.BodyFailed,
+                    }
+                }
 
                 const pollable = wht.resources.future_incoming_response.subscribe(future);
                 b.wasi_io_poll.resources.pollable.block(pollable);

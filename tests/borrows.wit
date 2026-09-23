@@ -1,0 +1,36 @@
+package test:borrows;
+
+interface i {
+  resource r {
+    constructor(v: u32);
+    get: func() -> u32;
+  }
+}
+
+interface user {
+  use i.{r};
+
+  record pair { a: borrow<r>, b: u32 }
+  variant pick { nothing, one(borrow<r>), num(u32) }
+
+  f-record: func(p: pair) -> u32;
+  f-list: func(xs: list<borrow<r>>) -> u32;
+  f-option: func(x: option<borrow<r>>) -> u32;
+  f-result: func(x: result<borrow<r>, u32>) -> u32;
+  f-tuple: func(x: tuple<borrow<r>, u32, borrow<r>>) -> u32;
+  f-variant: func(x: pick) -> u32;
+  f-async: async func(xs: list<pair>) -> u32;
+
+  resource s {
+    constructor(x: borrow<r>);
+    add: func(x: borrow<r>) -> u32;
+    same: func(other: borrow<s>) -> u32;
+    create: static func(v: u32) -> s;
+    consume: static func(v: s) -> u32;
+  }
+  dtor-count: func() -> u32;
+}
+
+world provider { export i; }
+world middle { import i; export user; }
+world demo { import i; import user; export run: func() -> list<u32>; }

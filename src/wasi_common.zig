@@ -70,16 +70,16 @@ pub fn fillFromHost(comptime get_bytes: anytype, buf: []u8) void {
 /// slice of `(descriptor, path)` tuples as returned by
 /// `wasi:filesystem/preopens.get-directories()`). Returns the index of
 /// the winning preopen plus the remaining (relative) tail.
-/// Trailing/leading slashes in the user path are normalised;
+/// Matching ignores repeated slashes, `.` components and trailing slashes.
+/// `..` is left for the host to resolve.
 /// `error.NotPreopened` is returned when no preopen prefix matches.
 pub fn resolvePreopen(dirs: anytype, path: []const u8) error{NotPreopened}!struct { usize, []const u8 } {
     if (dirs.len == 0) return error.NotPreopened;
 
-    const is_absolute = path.len > 0 and path[0] == '/';
     var best: ?usize = null;
     var best_len: usize = 0;
     for (dirs, 0..) |p, i| {
-        const prefix_len = matchedPrefix(path, p[1], is_absolute) orelse continue;
+        const prefix_len = matchedPrefix(path, p[1]) orelse continue;
         if (best == null or prefix_len > best_len) {
             best = i;
             best_len = prefix_len;
@@ -92,18 +92,28 @@ pub fn resolvePreopen(dirs: anytype, path: []const u8) error{NotPreopened}!struc
     return .{ idx, rel };
 }
 
-/// Length of `prefix` consumed from `path` if `prefix` is a
-/// directory-aligned prefix, else null. A preopen named "." (the
-/// common `wasmtime --dir .` case) matches every relative input path
-/// with a zero-byte consumption so the rest is forwarded as-is.
-fn matchedPrefix(path: []const u8, prefix: []const u8, is_absolute: bool) ?usize {
-    if (std.mem.eql(u8, prefix, ".")) {
-        return if (is_absolute) null else 0;
+/// Return the end of the matching prefix in `path`, or null.
+/// A "." preopen matches any relative path without consuming it.
+fn matchedPrefix(path: []const u8, prefix: []const u8) ?usize {
+    const path_absolute = path.len > 0 and path[0] == '/';
+    const prefix_absolute = prefix.len > 0 and prefix[0] == '/';
+    if (path_absolute != prefix_absolute) return null;
+
+    var path_it = std.mem.tokenizeScalar(u8, path, '/');
+    var prefix_it = std.mem.tokenizeScalar(u8, prefix, '/');
+    var consumed: usize = 0;
+    while (nextComponent(&prefix_it)) |want| {
+        const got = nextComponent(&path_it) orelse return null;
+        if (!std.mem.eql(u8, want, got)) return null;
+        consumed = path_it.index;
     }
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    if (path.len == prefix.len) return prefix.len;
-    if (prefix.len > 0 and prefix[prefix.len - 1] == '/') return prefix.len;
-    if (path[prefix.len] == '/') return prefix.len;
+    return consumed;
+}
+
+fn nextComponent(it: *std.mem.TokenIterator(u8, .scalar)) ?[]const u8 {
+    while (it.next()) |component| {
+        if (!std.mem.eql(u8, component, ".")) return component;
+    }
     return null;
 }
 
@@ -132,19 +142,24 @@ pub const ParsedUrl = struct {
     path: []const u8,
 };
 
+/// Split an HTTP or HTTPS URL for `wasi:http`, omitting userinfo and fragments.
 pub fn parseUrl(url: []const u8) ?ParsedUrl {
-    var rest = url;
-    var https = false;
-    if (std.mem.startsWith(u8, rest, "https://")) {
-        https = true;
-        rest = rest[8..];
-    } else if (std.mem.startsWith(u8, rest, "http://")) {
-        rest = rest[7..];
-    } else return null;
-    const slash = std.mem.indexOfScalar(u8, rest, '/');
-    const host = if (slash) |i| rest[0..i] else rest;
+    const sep = std.mem.find(u8, url, "://") orelse return null;
+    const scheme = url[0..sep];
+    const https = if (std.ascii.eqlIgnoreCase(scheme, "https"))
+        true
+    else if (std.ascii.eqlIgnoreCase(scheme, "http"))
+        false
+    else
+        return null;
+    var rest = url[sep + 3 ..];
+    if (std.mem.findScalar(u8, rest, '#')) |i| rest = rest[0..i];
+    const authority_end = std.mem.findAny(u8, rest, "/?") orelse rest.len;
+    var host = rest[0..authority_end];
+    if (std.mem.findScalarLast(u8, host, '@')) |i| host = host[i + 1 ..];
     if (host.len == 0) return null;
-    const path = if (slash) |i| rest[i..] else "/";
+    // `set-path-with-query` accepts a query without a leading path.
+    const path = if (authority_end == rest.len) "/" else rest[authority_end..];
     return .{ .https = https, .host = host, .path = path };
 }
 
@@ -274,8 +289,30 @@ test "parseUrl handles common shapes" {
         try std.testing.expectEqualStrings("h", p.host);
         try std.testing.expectEqualStrings("/", p.path);
     }
+    {
+        const p = parseUrl("HTTP://user:pw@host:1/p?q#frag").?;
+        try std.testing.expect(!p.https);
+        try std.testing.expectEqualStrings("host:1", p.host);
+        try std.testing.expectEqualStrings("/p?q", p.path);
+    }
+    {
+        const p = parseUrl("http://example.com?q=1").?;
+        try std.testing.expectEqualStrings("example.com", p.host);
+        try std.testing.expectEqualStrings("?q=1", p.path);
+    }
+    {
+        const p = parseUrl("http://example.com#top").?;
+        try std.testing.expectEqualStrings("example.com", p.host);
+        try std.testing.expectEqualStrings("/", p.path);
+    }
+    {
+        const p = parseUrl("http://[::1]:8080/x").?;
+        try std.testing.expectEqualStrings("[::1]:8080", p.host);
+        try std.testing.expectEqualStrings("/x", p.path);
+    }
     try std.testing.expect(parseUrl("ftp://x/") == null);
     try std.testing.expect(parseUrl("https:///a") == null);
+    try std.testing.expect(parseUrl("http://?q") == null);
 }
 
 test "resolvePreopen picks longest prefix and normalises" {
@@ -300,6 +337,35 @@ test "resolvePreopen picks longest prefix and normalises" {
         try std.testing.expectEqualStrings("relative/file", rel);
     }
     try std.testing.expectError(error.NotPreopened, resolvePreopen(dirs[0..2], "/etc/passwd"));
+    try std.testing.expectError(error.NotPreopened, resolvePreopen(dirs[0..2], "/tmpfoo"));
+    {
+        const idx, const rel = try resolvePreopen(dirs[0..], "//tmp/./deep//x.txt");
+        try std.testing.expectEqual(@as(usize, 1), idx);
+        try std.testing.expectEqualStrings("x.txt", rel);
+    }
+}
+
+test "resolvePreopen ignores trailing slashes on preopen names" {
+    const dirs = [_]struct { u32, []const u8 }{
+        .{ 1, "/data/" },
+        .{ 2, "/" },
+    };
+    {
+        const idx, const rel = try resolvePreopen(dirs[0..], "/data");
+        try std.testing.expectEqual(@as(usize, 0), idx);
+        try std.testing.expectEqualStrings(".", rel);
+    }
+    {
+        const idx, const rel = try resolvePreopen(dirs[0..], "/data/a/b");
+        try std.testing.expectEqual(@as(usize, 0), idx);
+        try std.testing.expectEqualStrings("a/b", rel);
+    }
+    {
+        const idx, const rel = try resolvePreopen(dirs[0..], "/etc/x");
+        try std.testing.expectEqual(@as(usize, 1), idx);
+        try std.testing.expectEqualStrings("etc/x", rel);
+    }
+    try std.testing.expectError(error.NotPreopened, resolvePreopen(dirs[0..], "rel"));
 }
 
 test "dupeTuplesStable deep-copies string fields" {

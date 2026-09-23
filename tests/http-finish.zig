@@ -8,8 +8,7 @@ comptime {
 pub const wit_exports = struct {
     pub const run = struct {
         pub fn run() b.run_run_result {
-            // Finishing a short body fails before outgoing-handler.handle
-            // sends the request. The error must not double-drop the body.
+            // Both a short body and a refused connection must fail without a double-drop.
             var response = wasi.http.fetch(std.heap.wasm_allocator, .{
                 .url = "http://127.0.0.1:1/",
                 .headers = &.{.{ .name = "content-length", .value = "2" }},

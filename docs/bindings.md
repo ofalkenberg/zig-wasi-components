@@ -105,40 +105,40 @@ This is the complete table. Anything in this table can appear in a
 parameter, a return type, a record field, a variant payload, or a list
 element. The generator handles it in both directions.
 
-| WIT                                | Zig                                              | Notes                                                                                                                                                                                |
-| ---------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `bool`                             | `bool`                                           |                                                                                                                                                                                      |
-| `s8` `s16` `s32` `s64`             | `i8` `i16` `i32` `i64`                           |                                                                                                                                                                                      |
-| `u8` `u16` `u32` `u64`             | `u8` `u16` `u32` `u64`                           |                                                                                                                                                                                      |
-| `f32` `f64`                        | `f32` `f64`                                      |                                                                                                                                                                                      |
-| `char`                             | `u21`                                            | Unicode scalar value, unchecked.                                                                                                                                                     |
-| `string`                           | `[]const u8`                                     | UTF-8. Memory in the canonical-ABI arena.                                                                                                                                            |
-| `list<T>`                          | `[]const T`                                      | Slice. Memory in the canonical-ABI arena.                                                                                                                                            |
-| `list<T, N>`                       | `[N]T`                                           | Fixed-length, by-value array.                                                                                                                                                        |
-| `tuple<A, B, ...>`                 | `struct { A, B, ... }`                           | Anonymous tuple struct.                                                                                                                                                              |
+| WIT                                | Zig                                              | Notes                                                                                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bool`                             | `bool`                                           |                                                                                                                                                                                        |
+| `s8` `s16` `s32` `s64`             | `i8` `i16` `i32` `i64`                           |                                                                                                                                                                                        |
+| `u8` `u16` `u32` `u64`             | `u8` `u16` `u32` `u64`                           |                                                                                                                                                                                        |
+| `f32` `f64`                        | `f32` `f64`                                      |                                                                                                                                                                                        |
+| `char`                             | `u21`                                            | Unicode scalar value, unchecked.                                                                                                                                                       |
+| `string`                           | `[]const u8`                                     | UTF-8. Memory in the canonical-ABI arena.                                                                                                                                              |
+| `list<T>`                          | `[]const T`                                      | Slice. Memory in the canonical-ABI arena.                                                                                                                                              |
+| `list<T, N>`                       | `[N]T`                                           | Fixed-length, by-value array.                                                                                                                                                          |
+| `tuple<A, B, ...>`                 | `struct { A, B, ... }`                           | Anonymous tuple struct.                                                                                                                                                                |
 | `map<K, V>`                        | `[]const struct { K, V }`                        | Pair slice. This is the canonical `list<tuple<K, V>>` despecialization (WASI 0.3.1). All pairs are passed through. The consumer applies the spec's duplicate-key rule (last one wins). |
-| `option<T>`                        | `?T`                                             | Zig nullable.                                                                                                                                                                        |
-| `result<T, E>`                     | `union(enum) { ok: T, err: E }`                  | Named per-function (e.g. `safe_divide_result`).                                                                                                                                      |
-| `result<_, E>`                     | `union(enum) { ok: void, err: E }`               | Same shape with empty ok arm.                                                                                                                                                        |
-| `result<T, _>`                     | `union(enum) { ok: T, err: void }`               | Same shape with empty err arm.                                                                                                                                                       |
-| `record { x: u32, y: u32 }`        | `struct { x: u32, y: u32 }`                      | Field order preserved; field names hyphen→underscore.                                                                                                                                |
-| `variant { a, b(u32), c(string) }` | `union(enum) { a: void, b: u32, c: []const u8 }` |                                                                                                                                                                                      |
-| `enum { red, green, blue }`        | `enum(u8) { red, green, blue }`                  | Backing width is the smallest that fits.                                                                                                                                             |
-| `flags { read, write, exec }`      | `packed struct(u8) { read: bool, ... }`          | Backing width chosen to fit. Max 32 labels.                                                                                                                                          |
-| `resource foo` (imported)          | `enum(u32) { _ }`                                | Opaque handle. Methods live in an interface-named namespace.                                                                                                                         |
-| `resource foo` (exported)          | `*State` you define                              | Implementation pattern in [resources.md](resources.md).                                                                                                                              |
-| `own<foo>`                         | `foo` (the handle enum)                          | Same Zig type as the bare resource name.                                                                                                                                             |
-| `borrow<foo>`                      | `foo` (the handle enum)                          | Same Zig type as `own<foo>`; semantics differ host-side.                                                                                                                             |
-| `stream<T>` `future<T>`            | `abi.Stream`, `abi.Future`                       | 4-byte handle. Per-payload operations are generated for every function whose signature mentions one. See the intrinsics section below.                                               |
-| `error-context`                    | `abi.ErrorContext`                               | Opaque 4-byte handle.                                                                                                                                                                |
+| `option<T>`                        | `?T`                                             | Zig nullable.                                                                                                                                                                          |
+| `result<T, E>`                     | `union(enum) { ok: T, err: E }`                  | Named per-function (e.g. `safe_divide_result`).                                                                                                                                        |
+| `result<_, E>`                     | `union(enum) { ok: void, err: E }`               | Same shape with empty ok arm.                                                                                                                                                          |
+| `result<T, _>`                     | `union(enum) { ok: T, err: void }`               | Same shape with empty err arm.                                                                                                                                                         |
+| `record { x: u32, y: u32 }`        | `struct { x: u32, y: u32 }`                      | Field order preserved; field names hyphen→underscore.                                                                                                                                  |
+| `variant { a, b(u32), c(string) }` | `union(enum) { a: void, b: u32, c: []const u8 }` |                                                                                                                                                                                        |
+| `enum { red, green, blue }`        | `enum(u8) { red, green, blue }`                  | Backing width is the smallest that fits.                                                                                                                                               |
+| `flags { read, write, exec }`      | `packed struct(u8) { read: bool, ... }`          | Backing width chosen to fit. Max 32 labels.                                                                                                                                            |
+| `resource foo` (imported)          | `enum(u32) { _ }`                                | Opaque handle. Methods live in an interface-named namespace.                                                                                                                           |
+| `resource foo` (exported)          | `*State` you define                              | Implementation pattern in [resources.md](resources.md).                                                                                                                                |
+| `own<foo>`                         | `foo` (the handle enum)                          | Same Zig type as the bare resource name. For a resource you export, convert with `<iface>.resources.foo.new/rep/drop` (`resources_<name>` for a named export).                         |
+| `borrow<foo>`                      | `foo`, or `*State` if you export `foo`           | A borrow of your own resource arrives as its state. Borrows of imported resources are dropped by the thunk once your function returns.                                                 |
+| `stream<T>` `future<T>`            | `abi.Stream`, `abi.Future`                       | 4-byte handle. Per-payload operations are generated for every function whose signature mentions one. See the intrinsics section below.                                                 |
+| `error-context`                    | `abi.ErrorContext`                               | Opaque 4-byte handle.                                                                                                                                                                  |
 
 ### Synthetic result types
 
 When a WIT function returns an `option`, `result`, `variant`, `tuple`,
 or `record`, the generator emits a named type for the return value. It
 does not emit an anonymous type. The name is `<function_name>_result`.
-For composite parameters that need naming, it is
-`<function_name>_<param_name>`:
+For parameters that are an `option`, `result` or `tuple`, or that nest
+a `result` anywhere inside, it is `<function_name>_<param_name>`:
 
 ```wit
 export safe-divide: func(a: u32, b: u32) -> result<u32, string>;
@@ -186,6 +186,12 @@ responds, and the result is lifted back to Zig types.
 the call through `[async-lower]`. If the host does not complete it
 immediately, it parks the subtask in a waitable-set. It then waits for
 the result. From your code, an async import is just a function call.
+
+A few member names belong to the generated namespaces: `types`,
+`resources` and `intrinsics_*` inside an interface, `drop` inside a
+resource, and `new` inside a resource that has a constructor.
+An import whose WIT name would take one of them gets an `_` appended,
+so `types: func()` is called as `bindings.<iface>.types_()`.
 
 The lifetime of any `[]const u8` or `[]const T` returned from an import
 is the rest of the current call into your component. The host writes it

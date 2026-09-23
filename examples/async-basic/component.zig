@@ -35,35 +35,26 @@ pub const wit_exports = struct {
             return @intCast(s.len);
         }
 
-        /// Stream-producing async export driven through the typed
-        /// state-machine API. `start` creates the stream, kicks off
-        /// the async write, calls `taskReturn` so the host can attach
-        /// a reader, then asks the runtime to WAIT until the host has
-        /// drained the buffered bytes. `step` runs when EVENT_STREAM_WRITE
-        /// fires, drops the writable end + waitable-set, and EXITs.
+        /// Return a stream while its write is pending.
+        /// State owns the buffer until the host finishes reading.
         pub const greet = struct {
             pub const State = struct {
                 writable: abi.Stream,
                 wait_set: abi.WaitableSet,
+                buf: [128]u8,
             };
 
             pub fn start(state: *State, taskReturn: anytype, name: []const u8) abi.Step {
                 const ends = greet_stream.new();
+                state.writable = ends.writable;
+                state.wait_set = abi.WaitableSet.init();
 
-                var buf: [128]u8 = undefined;
-                const greeting = std.fmt.bufPrint(&buf, "Hello, {s}!", .{name}) catch "Hello!";
+                const greeting = std.fmt.bufPrint(&state.buf, "Hello, {s}!", .{name}) catch "Hello!";
 
-                // Async write — returns BLOCKED until the host attaches a
-                // reader, which happens after task.return publishes the
-                // readable end and this start function returns `.wait`.
                 _ = greet_stream.writeAsync(ends.writable, greeting);
 
                 taskReturn(ends.readable);
 
-                state.* = .{
-                    .writable = ends.writable,
-                    .wait_set = abi.WaitableSet.init(),
-                };
                 state.wait_set.join(@intFromEnum(ends.writable));
                 return .{ .wait = state.wait_set.handle };
             }
@@ -83,19 +74,20 @@ pub const wit_exports = struct {
             pub const State = struct {
                 writable: abi.Future,
                 wait_set: abi.WaitableSet,
+                value: u32,
             };
 
             pub fn start(state: *State, taskReturn: anytype, value: u32) abi.Step {
                 const ends = promise_future.new();
-                const doubled = value *% 2;
-                _ = promise_future.writeAsync(ends.writable, &doubled);
-
-                taskReturn(ends.readable);
-
                 state.* = .{
                     .writable = ends.writable,
                     .wait_set = abi.WaitableSet.init(),
+                    .value = value *% 2,
                 };
+                _ = promise_future.writeAsync(ends.writable, &state.value);
+
+                taskReturn(ends.readable);
+
                 state.wait_set.join(@intFromEnum(ends.writable));
                 return .{ .wait = state.wait_set.handle };
             }

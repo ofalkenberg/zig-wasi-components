@@ -689,8 +689,8 @@ test "futureAwait supports futures without a payload" {
     try std.testing.expect(futureAwait(ns, @fromBackingInt(@intCast(1))) == null);
 }
 
-/// Drop the readable + writable ends of a stream/future. Drop the handle
-/// you no longer own; the other side is held by the peer.
+/// An `error-context` handle created by this component, e.g. to attach
+/// a message to a failed stream or future.
 pub const ErrorContextValue = struct {
     handle: u32,
 

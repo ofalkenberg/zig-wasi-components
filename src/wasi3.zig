@@ -50,16 +50,34 @@ pub fn Wasi3(comptime b: type) type {
         pub const FsError = common.FsError;
         pub const NetError = common.NetError;
 
-        /// The common 0.3 write shape: pump `data` into the writable
-        /// end, drop it to signal EOF, then await the operation's
-        /// result future. `ns` is a generated intrinsics namespace
-        /// with `stream0` (the payload) and `future1` (the result).
+        /// Close the stream to signal EOF before awaiting the host's result.
+        /// Await it even if writing failed so the host can report the cause.
         fn writeViaStream(comptime ns: type, writable: abi.Stream, fut: abi.Future, data: []const u8) StreamError!ns.future1.T {
             defer ns.future1.dropReadable(fut);
             const wr = abi.streamWriteAll(ns.stream0, writable, data);
             ns.stream0.dropWritable(writable);
+            const res = abi.futureAwait(ns.future1, fut) orelse {
+                try wr;
+                return error.StreamFailed;
+            };
+            if (res == .err) return res;
             try wr;
-            return abi.futureAwait(ns.future1, fut) orelse error.StreamFailed;
+            return res;
+        }
+
+        /// A partial read skips the result future to avoid waiting for EOF.
+        /// A null result also covers a future closed without a value.
+        fn readViaStream(comptime ns: type, gpa: std.mem.Allocator, readable: abi.Stream, fut: abi.Future, max_bytes: usize) (StreamError || std.mem.Allocator.Error)!struct { []u8, ?ns.future1.T } {
+            defer ns.future1.dropReadable(fut);
+            const drained = abi.streamDrainBytesEof(ns.stream0, gpa, readable, max_bytes);
+            ns.stream0.dropReadable(readable);
+            const r = try drained;
+            return .{ r.data, if (r.eof) abi.futureAwait(ns.future1, fut) else null };
+        }
+
+        fn resultFailed(comptime fut_ns: type, fut: abi.Future) bool {
+            const res = abi.futureAwait(fut_ns, fut) orelse return false;
+            return res == .err;
         }
 
         pub const clock = struct {
@@ -161,14 +179,18 @@ pub fn Wasi3(comptime b: type) type {
         }
 
         pub const stdin = struct {
-            /// Read stdin until EOF or `max_bytes`. Caller owns the
-            /// returned slice.
+            /// Read stdin until EOF or `max_bytes`.
+            /// Caller owns the returned slice.
+            /// Host read errors return `error.StreamFailed`.
             pub fn read(gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
                 const ns = b.wasi_cli_stdin.intrinsics_read_via_stream;
                 const pair = b.wasi_cli_stdin.read_via_stream();
-                defer ns.future1.dropReadable(pair[1]);
-                defer ns.stream0.dropReadable(pair[0]);
-                return abi.streamDrainBytes(ns.stream0, gpa, pair[0], max_bytes);
+                const data, const res = try readViaStream(ns, gpa, pair[0], pair[1], max_bytes);
+                if (res != null and res.? == .err) {
+                    gpa.free(data);
+                    return error.StreamFailed;
+                }
+                return data;
             }
         };
 
@@ -306,15 +328,9 @@ pub fn Wasi3(comptime b: type) type {
 
                 const ns = fsd.intrinsics_read_via_stream;
                 const pair = fsd.read_via_stream(fd, 0);
-                defer ns.future1.dropReadable(pair[1]);
-
-                const drained = abi.streamDrainBytes(ns.stream0, gpa, pair[0], std.math.maxInt(usize));
-                ns.stream0.dropReadable(pair[0]);
-                const data = try drained;
+                const data, const res = try readViaStream(ns, gpa, pair[0], pair[1], std.math.maxInt(usize));
                 errdefer gpa.free(data);
-
-                const res = abi.futureAwait(ns.future1, pair[1]) orelse return error.StreamFailed;
-                return switch (res) {
+                return switch (res orelse return error.StreamFailed) {
                     .ok => data,
                     .err => |e| mapError(e),
                 };
@@ -545,21 +561,31 @@ pub fn Wasi3(comptime b: type) type {
                 send_done: bool = false,
                 recv_done: bool = false,
 
+                /// Write all bytes, reporting host errors as `error.StreamFailed`.
+                /// A closed stream without a host error returns `error.StreamClosed`.
                 pub fn write(self: *TcpStream, data: []const u8) StreamError!void {
                     if (self.send_done) return error.StreamClosed;
-                    return abi.streamWriteAll(tcp.intrinsics_send.stream0, self.send_writable, data) catch |e| {
-                        if (e == error.StreamClosed) self.send_done = true;
+                    abi.streamWriteAll(tcp.intrinsics_send.stream0, self.send_writable, data) catch |e| {
+                        if (e != error.StreamClosed) return e;
+                        self.send_done = true;
+                        if (resultFailed(tcp.intrinsics_send.future1, self.send_future)) return error.StreamFailed;
                         return e;
                     };
                 }
 
                 /// Read until the peer closes or `max_bytes` arrive.
-                /// After the peer closes, further calls return an empty
-                /// slice (EOF), matching the 0.2 layer's behaviour.
+                /// After the peer closes, further calls return an empty slice.
+                /// Host read errors return `error.StreamFailed`.
                 pub fn readAll(self: *TcpStream, gpa: std.mem.Allocator, max_bytes: usize) ![]u8 {
                     if (self.recv_done) return gpa.alloc(u8, 0);
                     const r = try abi.streamDrainBytesEof(tcp.intrinsics_receive.stream0, gpa, self.recv_readable, max_bytes);
-                    if (r.eof) self.recv_done = true;
+                    if (r.eof) {
+                        self.recv_done = true;
+                        if (resultFailed(tcp.intrinsics_receive.future1, self.recv_future)) {
+                            gpa.free(r.data);
+                            return error.StreamFailed;
+                        }
+                    }
                     return r.data;
                 }
 

@@ -39,7 +39,7 @@ Use it to find the world name for `gen`.
 ```sh
 $ zig_wasi_components dump examples/greeter/greeter.wit
 package demo:greeter@0.1.0
-  1 world(s), 0 interface(s), 0 type(s), 0 dep(s)
+  1 world(s), 0 interface(s), 0 dep(s)
   world greeter:
     import log (func)
     import origin (func)

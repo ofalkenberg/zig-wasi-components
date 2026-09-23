@@ -144,6 +144,41 @@ instance shuts down. The host then calls the auto-emitted
 `[resource-drop]<resource>` export. That export calls your
 `destructor(self: *State)`, which must free the memory.
 
+## Handles to your own resource
+
+Constructors and method receivers are converted for you, but a resource
+can also travel as a plain parameter or result.
+A `borrow<counter>` parameter arrives as `*State`, like `self` does.
+An `own<counter>` is a real handle (`types.counter`), and the interface
+struct in the bindings carries the helpers to deal with it:
+
+```zig
+const helpers = bindings.demo_res_counters.resources.counter;
+
+pub fn create(value: u32) bindings.demo_res_counters.types.counter {
+    return helpers.new(allocState(value));
+}
+
+pub fn consume(c: bindings.demo_res_counters.types.counter) u32 {
+    const value = helpers.rep(c).value;
+    helpers.drop(c);
+    return value;
+}
+```
+
+Handles are not reference counted.
+Every handle `new` returns is an independent owner of its state, and
+dropping any one of them runs `destructor`.
+Minting a second handle for a state that already has one therefore
+leads to a double free (or a use after free through the other handle).
+If several handles must share one state, keep your own reference count
+in `State` and free only when it reaches zero.
+
+When the world exports the interface under a name
+(`export main: counters;`), the helpers live in `resources_<name>`
+instead (`resources_main.counter`), one namespace per export, because
+each export has its own handle table.
+
 ## Resources you import vs. resources you export
 
 This page covers resources that your component *exports*. These are
@@ -161,6 +196,14 @@ handle as its first argument. That namespace also has a `drop` helper
 when you own the handle. The wasi:http guest in `examples/http-get/` is
 the largest example. It consumes more than a dozen imported resources
 with their complete method surface.
+
+A `borrow<T>` of an imported resource that your export receives is only
+valid for the duration of the call.
+The generated thunk drops it after your function returns, as the
+canonical ABI requires, so don't keep it around.
+The one exception is the state-machine form of an async export: the
+thunk can't know when you are done, so drop each borrowed parameter
+yourself before calling `taskReturn`.
 
 ## What is not yet supported
 
@@ -181,10 +224,13 @@ most `wasi:filesystem` descriptor and `wasi:sockets` socket methods
 `async func`s. The `wasi3` convenience module blocks on their subtasks
 in the `wasi-demo-p3` example.
 
-Resource methods whose signatures mention `stream<T>` or `future<T>`
-also get the per-function intrinsics namespaces described in
-[bindings.md](bindings.md). Their namespace is
-`bindings.<interface>.resources.<resource>.intrinsics_<method>`.
+Methods of *imported* resources whose signatures mention `stream<T>`
+or `future<T>` also get the per-function intrinsics namespaces
+described in [bindings.md](bindings.md). Their namespace is
+`bindings.<interface>.resources.<resource>.intrinsics_<method>`, named
+after the WIT method even when the method itself got an `_` suffix
+(a constructor's is `intrinsics_constructor`).
+Members of resources you export don't get them yet.
 
 Async methods on resources you *export* have no consumer yet. If you
 find a schema that exercises them, please open an issue with the WIT.

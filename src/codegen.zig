@@ -54,14 +54,59 @@ pub const Options = struct {
     import_module: []const u8 = "$root",
 };
 
+/// WIT names cannot end in `_`, leaving that suffix for escaped names.
+fn memberNameAlloc(gpa: Allocator, name: []const u8, reserved: []const []const u8) Allocator.Error![]u8 {
+    if (std.mem.startsWith(u8, name, "intrinsics-") or containsString(reserved, name)) {
+        return std.fmt.allocPrint(gpa, "{s}_", .{name});
+    }
+    return gpa.dupe(u8, name);
+}
+
+const iface_reserved_names: []const []const u8 = &.{ "types", "resources" };
+
 // =====================================================================
 // Resolver — pools every type definition that should be visible
 // to a code-generation walk over a given world.
 // =====================================================================
 
+const ExportedResource = struct {
+    iface_prefix: []const u8,
+    name: []const u8,
+    /// Name of the export in `wit_exports`.
+    local_name: []const u8,
+    /// Core instance name used in `[export]<wasm_iface>` imports.
+    wasm_iface: []const u8,
+    /// Named exports need separate helpers even though they share types.
+    named: bool,
+
+    fn writeImplPath(er: ExportedResource, w: *std.Io.Writer) Error!void {
+        try w.writeAll("_exports.");
+        try zigIdent(w, er.local_name);
+        try w.writeAll(".");
+        try zigIdent(w, er.name);
+    }
+
+    fn writeHelpersNamespace(er: ExportedResource, w: *std.Io.Writer) Error!void {
+        try w.writeAll("resources");
+        if (!er.named) return;
+        try w.writeAll("_");
+        try zigIdentPart(w, er.local_name);
+    }
+};
+
 const Resolver = struct {
     gpa: Allocator,
     entries: std.ArrayList(Entry) = .empty,
+    /// Explicit imports whose borrow handles we can drop.
+    /// Also-exported interfaces are excluded because their shared types
+    /// cannot distinguish imported and exported borrows.
+    droppable_imports: std.ArrayList([]const u8) = .empty,
+    /// Includes implicit imports introduced by `use`.
+    /// Their resources remain imported even when the interface is also exported.
+    imported_closure: std.ArrayList([]const u8) = .empty,
+    /// Core instance name selecting the implementation for this export's borrows.
+    current_export: []const u8 = "",
+    exported_resources: std.ArrayList(ExportedResource) = .empty,
     /// Distinct iface prefix strings owned by this resolver. Entries'
     /// `iface_prefix` slices are interned into this list so they stay
     /// valid for the resolver's lifetime, regardless of where the
@@ -104,6 +149,62 @@ const Resolver = struct {
         for (self.prefix_pool.items) |s| self.gpa.free(s);
         self.prefix_pool.deinit(self.gpa);
         self.entries.deinit(self.gpa);
+        self.droppable_imports.deinit(self.gpa);
+        self.imported_closure.deinit(self.gpa);
+        self.exported_resources.deinit(self.gpa);
+    }
+
+    fn addImport(self: *Resolver, prefix: []const u8) Allocator.Error!void {
+        if (!try self.addToImportedClosure(prefix)) return;
+        try self.droppable_imports.append(self.gpa, try self.internPrefix(prefix));
+    }
+
+    fn addToImportedClosure(self: *Resolver, prefix: []const u8) Allocator.Error!bool {
+        if (containsString(self.imported_closure.items, prefix)) return false;
+        try self.imported_closure.append(self.gpa, try self.internPrefix(prefix));
+        return true;
+    }
+
+    fn addExportedResources(self: *Resolver, prefix: []const u8, local_name: []const u8, wasm_iface: []const u8, named: bool, types: []const wit.TypeDef) Error!void {
+        for (self.droppable_imports.items, 0..) |p, i| {
+            if (std.mem.eql(u8, p, prefix)) {
+                _ = self.droppable_imports.orderedRemove(i);
+                break;
+            }
+        }
+        if (containsString(self.imported_closure.items, prefix)) return;
+        const interned_prefix = try self.internPrefix(prefix);
+        const interned_iface = try self.internPrefix(wasm_iface);
+        for (types) |t| {
+            if (t.body != .resource) continue;
+            try self.exported_resources.append(self.gpa, .{
+                .iface_prefix = interned_prefix,
+                .name = t.name,
+                .local_name = local_name,
+                .wasm_iface = interned_iface,
+                .named = named,
+            });
+        }
+    }
+
+    /// Borrows of resources implemented here arrive as state pointers.
+    fn exportedResource(self: *Resolver, name: []const u8) ?ExportedResource {
+        const entry = self.resolveEntry(name) orelse return null;
+        var first: ?ExportedResource = null;
+        for (self.exported_resources.items) |er| {
+            if (!std.mem.eql(u8, er.iface_prefix, entry.iface_prefix) or
+                !std.mem.eql(u8, er.name, entry.td.name)) continue;
+            if (std.mem.eql(u8, er.wasm_iface, self.current_export)) return er;
+            if (first == null) first = er;
+        }
+        return first;
+    }
+
+    fn importedResource(self: *Resolver, name: []const u8) ?Entry {
+        const entry = self.resolveEntry(name) orelse return null;
+        if (entry.td.body != .resource) return null;
+        if (!containsString(self.droppable_imports.items, entry.iface_prefix)) return null;
+        return entry;
     }
 
     fn add(self: *Resolver, t: wit.TypeDef) Allocator.Error!void {
@@ -610,6 +711,19 @@ fn emitDispatchPath(w: *std.Io.Writer, path: []const u8) Error!void {
 fn needsAlias(kind: wit.TypeRef.Kind) bool {
     return switch (kind) {
         .option, .result, .tuple => true,
+        else => containsResult(kind),
+    };
+}
+
+/// Zig gives each result union a distinct type, so nested results need an alias.
+fn containsResult(kind: wit.TypeRef.Kind) bool {
+    return switch (kind) {
+        .result => true,
+        .list, .map, .option => |inner| containsResult(inner.kind),
+        .list_fixed => |info| containsResult(info.elem.kind),
+        .tuple => |elems| for (elems) |e| {
+            if (containsResult(e.kind)) break true;
+        } else false,
         else => false,
     };
 }
@@ -1267,7 +1381,7 @@ fn emitTypeRef(w: *std.Io.Writer, r: *Resolver, t: wit.TypeRef) Error!void {
         .f64 => try w.writeAll("f64"),
         .char => try w.writeAll("u21"),
         .string => try w.writeAll("[]const u8"),
-        .error_context => try w.writeAll("abi.ErrorContext"),
+        .error_context => try w.writeAll("_abi.ErrorContext"),
         // A map binds as a slice of key/value pairs, its canonical
         // despecialization. Duplicate-key policy is the consumer's.
         .list, .map => |inner| {
@@ -1303,19 +1417,24 @@ fn emitTypeRef(w: *std.Io.Writer, r: *Resolver, t: wit.TypeRef) Error!void {
             }
             try w.writeAll(" }");
         },
-        .own, .borrow => |name| try emitNamedTypeRef(w, r, name),
-        .stream => try w.writeAll("abi.Stream"),
-        .future => try w.writeAll("abi.Future"),
+        .own => |name| try emitNamedTypeRef(w, r, name),
+        .borrow => |name| if (r.exportedResource(name)) |er| {
+            try w.writeAll("*");
+            try er.writeImplPath(w);
+            try w.writeAll(".State");
+        } else try emitNamedTypeRef(w, r, name),
+        .stream => try w.writeAll("_abi.Stream"),
+        .future => try w.writeAll("_abi.Future"),
         .named => |name| try emitNamedTypeRef(w, r, name),
     }
 }
 
-/// Qualify interface types even inside their own namespace. A world
-/// `use` can introduce an ambiguous file-scope name.
+/// Rooted paths avoid ambiguity with world aliases and interface members.
 fn emitNamedTypeRef(w: *std.Io.Writer, r: *Resolver, name: []const u8) Error!void {
     const entry = r.resolveEntry(name) orelse return Error.UnknownType;
     const owner = entry.iface_prefix;
     if (owner.len != 0) {
+        try w.writeAll("_root.");
         try zigIdent(w, owner);
         try w.writeAll(".types.");
     }
@@ -1391,7 +1510,7 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
         .u64 => try w.print("@as(*align(8) const u64, @ptrFromInt({s} + {d})).*", .{ base, offset }),
         .f32 => try w.print("@as(*align(4) const f32, @ptrFromInt({s} + {d})).*", .{ base, offset }),
         .f64 => try w.print("@as(*align(8) const f64, @ptrFromInt({s} + {d})).*", .{ base, offset }),
-        .char => try w.print("abi.liftChar(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*)", .{ base, offset }),
+        .char => try w.print("_abi.liftChar(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*)", .{ base, offset }),
         .string => {
             try w.print("@as([*]const u8, @ptrFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))[0..@as(*align(4) const u32, @ptrFromInt({s} + {d})).*]", .{ base, offset, base, offset + 4 });
         },
@@ -1402,10 +1521,14 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
             defer r.gpa.free(len_expr);
             try emitLiftListExpr(w, r, inner.*, ptr_expr, len_expr, zig_type);
         },
-        .own, .borrow => try w.print("@enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*)", .{ base, offset }),
-        .error_context => try w.print("@as(abi.ErrorContext, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
-        .stream => try w.print("@as(abi.Stream, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
-        .future => try w.print("@as(abi.Future, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
+        .own, .borrow => |name| {
+            const is_rep = ty.kind == .borrow and r.exportedResource(name) != null;
+            const cast = if (is_rep) "@ptrFromInt(@as(usize, " else "@enumFromInt((";
+            try w.print("{s}@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ cast, base, offset });
+        },
+        .error_context => try w.print("@as(_abi.ErrorContext, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
+        .stream => try w.print("@as(_abi.Stream, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
+        .future => try w.print("@as(_abi.Future, @enumFromInt(@as(*align(4) const u32, @ptrFromInt({s} + {d})).*))", .{ base, offset }),
         .named => |nm| {
             const scope = r.enterType(nm) orelse return Error.UnknownType;
             defer scope.deinit();
@@ -1453,10 +1576,10 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
                         } else try w.writeAll(" = {}");
                         try w.writeAll(" },");
                     }
-                    try w.writeAll(" else => abi.trap() }; }");
+                    try w.writeAll(" else => _abi.trap() }; }");
                 },
                 .@"enum" => |cases| {
-                    try w.writeAll("abi.liftEnum(");
+                    try w.writeAll("_abi.liftEnum(");
                     try emitNamedTypeRef(w, r, td.name);
                     try w.writeAll(", ");
                     try emitLoadDisc(w, base, offset, discSize(cases.len));
@@ -1485,7 +1608,7 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
             if (wrap) try w.print("@as({s}, ", .{child_type});
             try emitLoadMem(w, r, inner.*, base, offset + p_off, child_type);
             if (wrap) try w.writeAll(")");
-            try w.writeAll(", else => abi.trap() }; }");
+            try w.writeAll(", else => _abi.trap() }; }");
         },
         .result => |info| {
             var payload_align: u32 = 1;
@@ -1514,7 +1637,7 @@ fn emitLoadMem(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, base: []const u
                 defer r.gpa.free(field_type);
                 try emitLoadMem(w, r, p.*, base, offset + p_off, field_type);
             } else try w.writeAll("{}");
-            try w.writeAll(" }, else => abi.trap() }; }");
+            try w.writeAll(" }, else => _abi.trap() }; }");
         },
         .tuple => |elems| {
             try w.writeAll(".{");
@@ -1799,7 +1922,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
             slot.* += 1;
         },
         .char => {
-            try w.writeAll("abi.liftChar(@as(u32, @bitCast(");
+            try w.writeAll("_abi.liftChar(@as(u32, @bitCast(");
             try emitSlotAs(w, slots, slot.*, .i32);
             try w.writeAll(")))");
             slot.* += 1;
@@ -1824,10 +1947,11 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
             try emitLiftListExpr(w, r, inner.*, ptr_expr, len_expr, zig_type);
             slot.* += 2;
         },
-        .own, .borrow => {
-            try w.writeAll("@enumFromInt(@as(u32, @bitCast(");
+        .own, .borrow => |name| {
+            const is_rep = ty.kind == .borrow and r.exportedResource(name) != null;
+            try w.writeAll(if (is_rep) "@ptrFromInt(@as(usize, @as(u32, @bitCast(" else "@enumFromInt(@as(u32, @bitCast(");
             try emitSlotAs(w, slots, slot.*, .i32);
-            try w.writeAll(")))");
+            try w.writeAll(if (is_rep) "))))" else ")))");
             slot.* += 1;
         },
         .option => |inner| {
@@ -1843,7 +1967,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
             if (wrap) try w.print("@as({s}, ", .{child_type});
             try emitLiftFlat(w, r, inner.*, slots, slot, child_type);
             if (wrap) try w.writeAll(")");
-            try w.writeAll(", else => abi.trap() }; }");
+            try w.writeAll(", else => _abi.trap() }; }");
         },
         .result => |info| {
             const n = r.label_counter;
@@ -1867,7 +1991,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
                 try emitLiftFlat(w, r, p.*, slots, slot, field_type);
             } else try w.writeAll("{}");
             const err_end = slot.*;
-            try w.writeAll(" }, else => abi.trap() }; }");
+            try w.writeAll(" }, else => _abi.trap() }; }");
             slot.* = if (ok_end > err_end) ok_end else err_end;
         },
         .tuple => |elems| {
@@ -1920,11 +2044,11 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
                         } else try w.writeAll(" = {}");
                         try w.writeAll(" },");
                     }
-                    try w.writeAll(" else => abi.trap() }; }");
+                    try w.writeAll(" else => _abi.trap() }; }");
                     slot.* = after_disc + joined.len;
                 },
                 .@"enum" => {
-                    try w.writeAll("abi.liftEnum(");
+                    try w.writeAll("_abi.liftEnum(");
                     try emitNamedTypeRef(w, r, td.name);
                     try w.writeAll(", @as(u32, @bitCast(");
                     try emitSlotAs(w, slots, slot.*, .i32);
@@ -1951,7 +2075,7 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
             }
         },
         .error_context => {
-            try w.writeAll("@as(abi.ErrorContext, @enumFromInt(@as(u32, @bitCast(");
+            try w.writeAll("@as(_abi.ErrorContext, @enumFromInt(@as(u32, @bitCast(");
             try emitSlotAs(w, slots, slot.*, .i32);
             try w.writeAll("))))");
             slot.* += 1;
@@ -1976,6 +2100,118 @@ fn emitLiftFlat(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, slots: []const
     }
 }
 
+fn hasImportedBorrow(r: *Resolver, ty: wit.TypeRef) bool {
+    return switch (ty.kind) {
+        .borrow => |name| r.importedResource(name) != null,
+        .list, .map, .option => |inner| hasImportedBorrow(r, inner.*),
+        .list_fixed => |info| hasImportedBorrow(r, info.elem.*),
+        .result => |info| (if (info.ok) |p| hasImportedBorrow(r, p.*) else false) or
+            (if (info.err) |p| hasImportedBorrow(r, p.*) else false),
+        .tuple => |elems| for (elems) |e| {
+            if (hasImportedBorrow(r, e)) break true;
+        } else false,
+        .named => |name| blk: {
+            const scope = r.enterType(name) orelse break :blk false;
+            defer scope.deinit();
+            break :blk switch (scope.entry.td.body) {
+                .record => |fields| for (fields) |f| {
+                    if (hasImportedBorrow(r, f.ty)) break true;
+                } else false,
+                .variant => |cases| for (cases) |c| {
+                    if (c.ty) |t| if (hasImportedBorrow(r, t)) break true;
+                } else false,
+                .alias => |a| hasImportedBorrow(r, a),
+                else => false,
+            };
+        },
+        else => false,
+    };
+}
+
+/// The canonical ABI requires imported borrows to be dropped before task completion.
+fn emitBorrowDrops(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []const u8) Error!void {
+    if (!hasImportedBorrow(r, ty)) return;
+    switch (ty.kind) {
+        .borrow => |name| {
+            const entry = r.importedResource(name).?;
+            try w.writeAll("    _root.");
+            try zigIdent(w, entry.iface_prefix);
+            try w.writeAll(".resources.");
+            try zigIdent(w, entry.td.name);
+            try w.print(".drop({s});\n", .{expr});
+        },
+        .list, .map => |inner| try emitBorrowDropsLoop(w, r, inner.*, expr),
+        .list_fixed => |info| try emitBorrowDropsLoop(w, r, info.elem.*, expr),
+        .option => |inner| {
+            var buf: [16]u8 = undefined;
+            const capture = allocCapture(r, &buf);
+            try w.print("    if ({s}) |{s}| {{\n", .{ expr, capture });
+            try emitBorrowDrops(w, r, inner.*, capture);
+            try w.writeAll("    }\n");
+        },
+        .result => |info| {
+            try w.print("    switch ({s}) {{\n", .{expr});
+            try emitBorrowDropsProng(w, r, "ok", if (info.ok) |p| p.* else null);
+            try emitBorrowDropsProng(w, r, "err", if (info.err) |p| p.* else null);
+            try w.writeAll("    }\n");
+        },
+        .tuple => |elems| for (elems, 0..) |e, i| {
+            const field = try std.fmt.allocPrint(r.gpa, "{s}.@\"{d}\"", .{ expr, i });
+            defer r.gpa.free(field);
+            try emitBorrowDrops(w, r, e, field);
+        },
+        .named => |name| {
+            const scope = r.enterType(name) orelse return Error.UnknownType;
+            defer scope.deinit();
+            switch (scope.entry.td.body) {
+                .record => |fields| for (fields) |f| {
+                    var field: std.Io.Writer.Allocating = .init(r.gpa);
+                    defer field.deinit();
+                    try field.writer.print("{s}.", .{expr});
+                    try zigIdent(&field.writer, f.name);
+                    try emitBorrowDrops(w, r, f.ty, field.writer.buffered());
+                },
+                .variant => |cases| {
+                    try w.print("    switch ({s}) {{\n", .{expr});
+                    for (cases) |c| try emitBorrowDropsProng(w, r, c.name, c.ty);
+                    try w.writeAll("    }\n");
+                },
+                .alias => |a| try emitBorrowDrops(w, r, a, expr),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn emitBorrowDropsLoop(w: *std.Io.Writer, r: *Resolver, elem: wit.TypeRef, expr: []const u8) Error!void {
+    var buf: [16]u8 = undefined;
+    const capture = allocCapture(r, &buf);
+    try w.print("    for ({s}) |{s}| {{\n", .{ expr, capture });
+    try emitBorrowDrops(w, r, elem, capture);
+    try w.writeAll("    }\n");
+}
+
+fn emitBorrowDropsProng(w: *std.Io.Writer, r: *Resolver, case_name: []const u8, payload: ?wit.TypeRef) Error!void {
+    try w.writeAll("    .");
+    try zigIdent(w, case_name);
+    const t = payload orelse return w.writeAll(" => {},\n");
+    if (!hasImportedBorrow(r, t)) return w.writeAll(" => {},\n");
+    var buf: [16]u8 = undefined;
+    const capture = allocCapture(r, &buf);
+    try w.print(" => |{s}| {{\n", .{capture});
+    try emitBorrowDrops(w, r, t, capture);
+    try w.writeAll("    },\n");
+}
+
+fn emitParamBorrowDrops(w: *std.Io.Writer, r: *Resolver, params: []const wit.Param) Error!void {
+    for (params) |p| {
+        const name = try paramNameAlloc(r.gpa, p.name);
+        defer r.gpa.free(name);
+        try emitBorrowDrops(w, r, p.ty, name);
+    }
+}
+
 /// Emit Zig code that, given a value `expr` of WIT type `ty`,
 /// produces a single flat core value to be returned. Only valid when
 /// the type has exactly one flat representation slot; delegates to
@@ -1989,11 +2225,12 @@ fn emitLowerDirect(w: *std.Io.Writer, r: *Resolver, ty: wit.TypeRef, expr: []con
 // Function wrappers (exports and imports)
 // =====================================================================
 
-fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func, opts: Options) Error!void {
-    if (f.is_async) return emitImportDeclAsync(w, r, name, f, opts);
+/// `name` preserves the WIT import name; `zig_name` avoids namespace collisions.
+fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, zig_name: []const u8, f: wit.Func, opts: Options) Error!void {
+    if (f.is_async) return emitImportDeclAsync(w, r, name, zig_name, f, opts);
     if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
-    const result_type = try functionReturnTypeAlloc(r.gpa, name);
+    const result_type = try functionReturnTypeAlloc(r.gpa, zig_name);
     defer r.gpa.free(result_type);
     var flat_params: std.ArrayList(CoreType) = .empty;
     defer flat_params.deinit(gpa);
@@ -2034,7 +2271,7 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
 
     try emitDocs(w, f.docs, "    ");
     try w.writeAll("    pub fn ");
-    try zigIdent(w, name);
+    try zigIdent(w, zig_name);
     try w.writeAll("(");
     for (f.params, 0..) |p, i| {
         if (i != 0) try w.writeAll(", ");
@@ -2125,10 +2362,10 @@ fn emitImportDecl(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func
 /// the user-facing Zig surface synchronous (same shape as the sync
 /// path), which is the right default for a guest that doesn't itself
 /// run a task scheduler. Real coroutine drive can be layered on later.
-fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit.Func, opts: Options) Error!void {
+fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, zig_name: []const u8, f: wit.Func, opts: Options) Error!void {
     if (f.results.len > 1) return Error.Unsupported;
     const gpa = std.heap.page_allocator;
-    const result_type = try functionReturnTypeAlloc(r.gpa, name);
+    const result_type = try functionReturnTypeAlloc(r.gpa, zig_name);
     defer r.gpa.free(result_type);
     var flat_params: std.ArrayList(CoreType) = .empty;
     defer flat_params.deinit(gpa);
@@ -2159,7 +2396,7 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
 
     try emitDocs(w, f.docs, "    ");
     try w.writeAll("    pub fn ");
-    try zigIdent(w, name);
+    try zigIdent(w, zig_name);
     try w.writeAll("(");
     for (f.params, 0..) |p, i| {
         if (i != 0) try w.writeAll(", ");
@@ -2228,15 +2465,15 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
     // (RETURNED / START_CANCELLED / RETURN_CANCELLED). Subtask-drop
     // implicitly unjoins from the set, so the `defer _set.deinit()`
     // is safe.
-    try w.writeAll("        const _result = abi.SubtaskResult.unpack(@bitCast(_packed));\n");
+    try w.writeAll("        const _result = _abi.SubtaskResult.unpack(@bitCast(_packed));\n");
     try w.writeAll("        if (_result.status != .returned) {\n");
-    try w.writeAll("            const _set = abi.WaitableSet.init();\n");
+    try w.writeAll("            const _set = _abi.WaitableSet.init();\n");
     try w.writeAll("            defer _set.deinit();\n");
     try w.writeAll("            _set.join(_result.subtask);\n");
     try w.writeAll("            while (true) {\n");
     try w.writeAll("                const _ev = _set.wait();\n");
     try w.writeAll("                if (_ev.code == .subtask and _ev.p1 == _result.subtask) {\n");
-    try w.writeAll("                    const _st: abi.Status = @enumFromInt(_ev.p2);\n");
+    try w.writeAll("                    const _st: _abi.Status = @enumFromInt(_ev.p2);\n");
     // Cancellation paths: don't panic — leave `_retarea` undefined
     // and let the caller see the natural junk value. The host
     // cancelled us; a clean termination is the best we can do here
@@ -2244,7 +2481,7 @@ fn emitImportDeclAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, f: wit
     try w.writeAll("                    if (_st == .returned or _st == .start_cancelled or _st == .return_cancelled) break;\n");
     try w.writeAll("                }\n");
     try w.writeAll("            }\n");
-    try w.writeAll("            abi.root_async.@\"[subtask-drop]\"(_result.subtask);\n");
+    try w.writeAll("            _abi.root_async.@\"[subtask-drop]\"(_result.subtask);\n");
     try w.writeAll("        }\n");
 
     if (has_result) {
@@ -2301,14 +2538,14 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
         try w.writeAll(flat_results.items[0].zigName());
     }
     try w.writeAll(" {\n");
-    try w.writeAll("    realloc_state.enterTask();\n");
+    try w.writeAll("    _realloc_state.enterTask();\n");
 
     try emitLiftedParams(w, r, alias_prefix, f, indirect_params, flat_params.items);
 
     if (f.results.len == 0) {
-        try w.writeAll("    exports.");
+        try w.writeAll("    _exports.");
     } else {
-        try w.writeAll("    const _result = exports.");
+        try w.writeAll("    const _result = _exports.");
     }
     try emitDispatchPath(w, dispatch);
     try w.writeAll("(");
@@ -2317,6 +2554,7 @@ fn emitCabiExport(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispatch: [
         try emitParamName(w, p.name);
     }
     try w.writeAll(");\n");
+    try emitParamBorrowDrops(w, r, f.params);
 
     if (f.results.len == 0) {
         // nothing
@@ -2453,7 +2691,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
         }
     }
     try w.writeAll(") i32 {\n");
-    try w.writeAll("    realloc_state.enterTask();\n");
+    try w.writeAll("    _realloc_state.enterTask();\n");
 
     try emitLiftedParams(w, r, alias_prefix, f, indirect_params, flat_params.items);
 
@@ -2467,13 +2705,13 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     // matching `[callback]` mirrors the dispatch — see below. Both
     // branches compile because the dead branch is pruned by Zig at
     // analysis time (comptime-known condition).
-    try w.writeAll("    if (comptime @typeInfo(@TypeOf(exports.");
+    try w.writeAll("    if (comptime @typeInfo(@TypeOf(_exports.");
     try emitDispatchPath(w, dispatch);
     try w.writeAll(")) == .type) {\n");
-    try w.writeAll("        const _Sm = exports.");
+    try w.writeAll("        const _Sm = _exports.");
     try emitDispatchPath(w, dispatch);
     try w.writeAll(";\n");
-    try w.writeAll("        const _Slots = abi.StateSlots(_Sm.State);\n");
+    try w.writeAll("        const _Slots = _abi.StateSlots(_Sm.State);\n");
     try w.writeAll("        const _state = _Slots.alloc();\n");
     try w.print("        const _step = _Sm.start(_state, &{s}", .{tr_helper});
     for (f.params) |p| {
@@ -2485,7 +2723,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     try w.writeAll("    } else {\n");
 
     if (f.results.len == 0) {
-        try w.writeAll("        exports.");
+        try w.writeAll("        _exports.");
         try emitDispatchPath(w, dispatch);
         try w.writeAll("(");
         for (f.params, 0..) |p, i| {
@@ -2493,9 +2731,10 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
             try emitParamName(w, p.name);
         }
         try w.writeAll(");\n");
+        try emitParamBorrowDrops(w, r, f.params);
         try w.print("        {s}.*();\n", .{tr_ident});
     } else {
-        try w.writeAll("        const _result = exports.");
+        try w.writeAll("        const _result = _exports.");
         try emitDispatchPath(w, dispatch);
         try w.writeAll("(");
         for (f.params, 0..) |p, i| {
@@ -2503,6 +2742,7 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
             try emitParamName(w, p.name);
         }
         try w.writeAll(");\n");
+        try emitParamBorrowDrops(w, r, f.params);
         try emitTaskReturnLowering(w, r, gpa, f, name, tr_ident, "_result", indirect_results);
     }
 
@@ -2526,19 +2766,19 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
     try w.writeAll("export fn ");
     try zigExportAsyncCallbackIdent(w, name);
     try w.writeAll("(event0: i32, p1: i32, p2: i32) i32 {\n");
-    try w.writeAll("    if (comptime @typeInfo(@TypeOf(exports.");
+    try w.writeAll("    if (comptime @typeInfo(@TypeOf(_exports.");
     try emitDispatchPath(w, dispatch);
     try w.writeAll(")) == .type) {\n");
-    try w.writeAll("        const _Sm = exports.");
+    try w.writeAll("        const _Sm = _exports.");
     try emitDispatchPath(w, dispatch);
     try w.writeAll(";\n");
-    try w.writeAll("        const _Slots = abi.StateSlots(_Sm.State);\n");
+    try w.writeAll("        const _Slots = _abi.StateSlots(_Sm.State);\n");
     try w.writeAll("        const _state = _Slots.current();\n");
-    try w.writeAll("        const _step = _Sm.step(_state, @as(abi.Event, @enumFromInt(@as(u32, @bitCast(event0)))), @as(u32, @bitCast(p1)), @as(u32, @bitCast(p2)));\n");
+    try w.writeAll("        const _step = _Sm.step(_state, @as(_abi.Event, @enumFromInt(@as(u32, @bitCast(event0)))), @as(u32, @bitCast(p1)), @as(u32, @bitCast(p2)));\n");
     try emitStepDispatch(w);
     try w.writeAll("    } else {\n");
     try w.writeAll("        _ = .{ event0, p1, p2 };\n");
-    try w.writeAll("        _ = abi.async_cleanup.run();\n");
+    try w.writeAll("        _ = _abi.async_cleanup.run();\n");
     try emitCleanupOutcomeEpilogue(w);
     try w.writeAll("    }\n}\n\n");
 
@@ -2557,8 +2797,8 @@ fn emitCabiExportAsync(w: *std.Io.Writer, r: *Resolver, name: []const u8, dispat
 /// async exports, so the inline exitTask stands in for the sync
 /// cabi_post hook.
 fn emitCleanupOutcomeEpilogue(w: *std.Io.Writer) Error!void {
-    try w.writeAll("        const _outcome = abi.async_cleanup.lift_outcome();\n");
-    try w.writeAll("        if (_outcome == 0) realloc_state.exitTask();\n");
+    try w.writeAll("        const _outcome = _abi.async_cleanup.lift_outcome();\n");
+    try w.writeAll("        if (_outcome == 0) _realloc_state.exitTask();\n");
     try w.writeAll("        return _outcome;\n");
 }
 
@@ -2573,7 +2813,7 @@ fn emitCleanupOutcomeEpilogue(w: *std.Io.Writer) Error!void {
 fn emitStepDispatch(w: *std.Io.Writer) Error!void {
     try w.writeAll("        switch (_step) {\n");
     try w.writeAll("            .exit => {\n");
-    try w.writeAll("                realloc_state.exitTask();\n");
+    try w.writeAll("                _realloc_state.exitTask();\n");
     try w.writeAll("                _Slots.free();\n");
     try w.writeAll("                return 0;\n");
     try w.writeAll("            },\n");
@@ -2828,15 +3068,15 @@ fn emitOnePayloadIntrinsicSet(w: *std.Io.Writer, r: *Resolver, module: []const u
     try w.writeAll("\n");
 
     // Typed wrappers.
-    try w.writeAll("        pub const Ends = struct { readable: abi.");
+    try w.writeAll("        pub const Ends = struct { readable: _abi.");
     try w.writeAll(if (o.kind == .stream) "Stream" else "Future");
-    try w.writeAll(", writable: abi.");
+    try w.writeAll(", writable: _abi.");
     try w.writeAll(if (o.kind == .stream) "Stream" else "Future");
     try w.writeAll(" };\n\n");
 
     try w.print("        pub fn new() Ends {{\n", .{});
     try w.print("            const packed_val: u64 = @bitCast(@\"[{s}-new-{d}]{s}\"());\n", .{ verb, o.index, wit_func_name });
-    try w.writeAll("            const ends = abi.StreamEndsI64.unpack(packed_val);\n");
+    try w.writeAll("            const ends = _abi.StreamEndsI64.unpack(packed_val);\n");
     try w.writeAll("            return .{ .readable = @enumFromInt(ends.readable), .writable = @enumFromInt(ends.writable) };\n");
     try w.writeAll("        }\n\n");
 
@@ -2849,36 +3089,36 @@ fn emitOnePayloadIntrinsicSet(w: *std.Io.Writer, r: *Resolver, module: []const u
     if (isScalarPayload(r, o.payload)) {
         if (o.kind == .stream) {
             // read/write take element-count, NOT byte-count (per spec).
-            try w.print("        pub fn read(handle: abi.Stream, buf: []T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[stream-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn read(handle: _abi.Stream, buf: []T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[stream-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn write(handle: abi.Stream, buf: []const T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[stream-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn write(handle: _abi.Stream, buf: []const T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[stream-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn readAsync(handle: abi.Stream, buf: []T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[async-lower][stream-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn readAsync(handle: _abi.Stream, buf: []T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[async-lower][stream-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn writeAsync(handle: abi.Stream, buf: []const T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[async-lower][stream-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn writeAsync(handle: _abi.Stream, buf: []const T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[async-lower][stream-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len)));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
         } else {
-            try w.print("        pub fn read(handle: abi.Future, dst: *T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[future-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(dst))));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn read(handle: _abi.Future, dst: *T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[future-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(dst))));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn write(handle: abi.Future, value: *const T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[future-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(value))));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn write(handle: _abi.Future, value: *const T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[future-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(value))));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn readAsync(handle: abi.Future, dst: *T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[async-lower][future-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(dst))));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn readAsync(handle: _abi.Future, dst: *T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[async-lower][future-read-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(dst))));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
 
-            try w.print("        pub fn writeAsync(handle: abi.Future, value: *const T) abi.CopyOutcome {{\n", .{});
-            try w.print("            return abi.CopyOutcome.unpack(@\"[async-lower][future-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(value))));\n", .{ o.index, wit_func_name });
+            try w.print("        pub fn writeAsync(handle: _abi.Future, value: *const T) _abi.CopyOutcome {{\n", .{});
+            try w.print("            return _abi.CopyOutcome.unpack(@\"[async-lower][future-write-{d}]{s}\"(@intFromEnum(handle), @intCast(@intFromPtr(value))));\n", .{ o.index, wit_func_name });
             try w.writeAll("        }\n\n");
         }
     }
@@ -2897,8 +3137,8 @@ fn emitOnePayloadIntrinsicSet(w: *std.Io.Writer, r: *Resolver, module: []const u
         .{ "writeRawAsync", "write", "[async-lower]" },
     };
     for (raw_variants) |v| {
-        try w.print("        pub fn {s}(handle: abi.{s}, ptr: usize{s}) abi.CopyOutcome {{\n", .{ v[0], handle_ty, n_param });
-        try w.print("            return abi.CopyOutcome.unpack(@\"{s}[{s}-{s}-{d}]{s}\"(@intFromEnum(handle), @intCast(ptr){s}));\n", .{ v[2], verb, v[1], o.index, wit_func_name, n_arg });
+        try w.print("        pub fn {s}(handle: _abi.{s}, ptr: usize{s}) _abi.CopyOutcome {{\n", .{ v[0], handle_ty, n_param });
+        try w.print("            return _abi.CopyOutcome.unpack(@\"{s}[{s}-{s}-{d}]{s}\"(@intFromEnum(handle), @intCast(ptr){s}));\n", .{ v[2], verb, v[1], o.index, wit_func_name, n_arg });
         try w.writeAll("        }\n\n");
     }
 
@@ -2918,19 +3158,19 @@ fn emitOnePayloadIntrinsicSet(w: *std.Io.Writer, r: *Resolver, module: []const u
         try w.writeAll("        }\n\n");
     }
 
-    try w.print("        pub fn cancelRead(handle: abi.{s}) abi.CopyOutcome {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
-    try w.print("            return abi.CopyOutcome.unpack(@\"[{s}-cancel-read-{d}]{s}\"(@intFromEnum(handle)));\n", .{ verb, o.index, wit_func_name });
+    try w.print("        pub fn cancelRead(handle: _abi.{s}) _abi.CopyOutcome {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
+    try w.print("            return _abi.CopyOutcome.unpack(@\"[{s}-cancel-read-{d}]{s}\"(@intFromEnum(handle)));\n", .{ verb, o.index, wit_func_name });
     try w.writeAll("        }\n\n");
 
-    try w.print("        pub fn cancelWrite(handle: abi.{s}) abi.CopyOutcome {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
-    try w.print("            return abi.CopyOutcome.unpack(@\"[{s}-cancel-write-{d}]{s}\"(@intFromEnum(handle)));\n", .{ verb, o.index, wit_func_name });
+    try w.print("        pub fn cancelWrite(handle: _abi.{s}) _abi.CopyOutcome {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
+    try w.print("            return _abi.CopyOutcome.unpack(@\"[{s}-cancel-write-{d}]{s}\"(@intFromEnum(handle)));\n", .{ verb, o.index, wit_func_name });
     try w.writeAll("        }\n\n");
 
-    try w.print("        pub fn dropReadable(handle: abi.{s}) void {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
+    try w.print("        pub fn dropReadable(handle: _abi.{s}) void {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
     try w.print("            @\"[{s}-drop-readable-{d}]{s}\"(@intFromEnum(handle));\n", .{ verb, o.index, wit_func_name });
     try w.writeAll("        }\n\n");
 
-    try w.print("        pub fn dropWritable(handle: abi.{s}) void {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
+    try w.print("        pub fn dropWritable(handle: _abi.{s}) void {{\n", .{if (o.kind == .stream) "Stream" else "Future"});
     try w.print("            @\"[{s}-drop-writable-{d}]{s}\"(@intFromEnum(handle));\n", .{ verb, o.index, wit_func_name });
     try w.writeAll("        }\n");
     try w.writeAll("    };\n\n");
@@ -2968,7 +3208,7 @@ fn emitRetareaAndPostReturn(
     try w.writeAll(") void {\n");
     if (indirect_results) try w.writeAll("    _ = _ptr;\n");
     if (!indirect_results and flat_results.len == 1) try w.writeAll("    _ = _r;\n");
-    try w.writeAll("    realloc_state.exitTask();\n}\n\n");
+    try w.writeAll("    _realloc_state.exitTask();\n}\n\n");
 }
 
 fn retareaNameAlloc(gpa: Allocator, fn_name: []const u8) Allocator.Error![]u8 {
@@ -3021,11 +3261,10 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
 
     var resolver: Resolver = .{ .gpa = gpa };
     defer resolver.deinit();
-    // World-scope and pkg-scope types live at file scope (no iface prefix).
+    // World-scope types live at file scope (no iface prefix).
     var included_worlds: std.ArrayList(*const wit.World) = .empty;
     defer included_worlds.deinit(gpa);
     try registerWorldTypes(&resolver, &pkg, &world, &included_worlds);
-    for (pkg.types) |t| try resolver.add(t);
     // Interface types are scoped to that interface's struct namespace.
     // The iface_prefix is the Zig-mangled iface name (e.g.
     // `wasi_http_types`). Resolver lookups prefer same-iface matches,
@@ -3041,7 +3280,6 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
             defer gpa.free(ifp);
             for (iface.types) |t| try resolver.addWithPrefix(ifp, t);
         }
-        for (dep.types) |t| try resolver.add(t);
     }
     for (flat_world.externs) |e| {
         if (e.body == .inline_interface) {
@@ -3067,14 +3305,56 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
     // adds `io-error` as belonging to wasi_http_types).
     try registerUseAliases(&resolver, &pkg, gpa);
 
+    for (flat_world.externs) |e| {
+        if (e.kind != .import) continue;
+        switch (e.body) {
+            .plain => |p| {
+                const lookup = findInterface(&pkg, p) orelse continue;
+                const wasm_iface = try externModuleName(gpa, e, lookup);
+                defer gpa.free(wasm_iface);
+                const prefix = try zigIfaceNameAlloc(gpa, wasm_iface);
+                defer gpa.free(prefix);
+                try resolver.addImport(prefix);
+            },
+            .inline_interface => try resolver.addImport(e.name),
+            else => {},
+        }
+    }
+    var closure_grew = true;
+    while (closure_grew) {
+        closure_grew = false;
+        for (resolver.entries.items) |entry| {
+            if (!entry.is_use_alias or entry.source_iface_prefix.len == 0) continue;
+            if (!containsString(resolver.imported_closure.items, entry.iface_prefix)) continue;
+            if (try resolver.addToImportedClosure(entry.source_iface_prefix)) closure_grew = true;
+        }
+    }
+
+    for (flat_world.externs) |e| {
+        if (e.kind != .@"export") continue;
+        switch (e.body) {
+            .plain => |p| {
+                const lookup = findInterface(&pkg, p) orelse continue;
+                const prefix = try ifacePrefixAlloc(gpa, lookup.pkg.*, lookup.iface.name);
+                defer gpa.free(prefix);
+                const wasm_iface = try externModuleName(gpa, e, lookup);
+                defer gpa.free(wasm_iface);
+                try resolver.addExportedResources(prefix, externLocalName(e, lookup), wasm_iface, e.named, lookup.iface.types);
+            },
+            .inline_interface => |iface| try resolver.addExportedResources(e.name, e.name, e.name, false, iface.types),
+            else => {},
+        }
+    }
+
     const ver_str = if (pkg.version) |v| v.text else "";
     const ver_at: []const u8 = if (ver_str.len != 0) "@" else "";
     try w.print(
         \\// Generated by zig-wasi-components from package {s}:{s}{s}{s} world {s}.
         \\// Hand edits will be lost.
         \\
-        \\const std = @import("std");
-        \\const abi = @import("zig_wasi_components").abi;
+        \\const _std = @import("std");
+        \\const _abi = @import("zig_wasi_components").abi;
+        \\const _root = @This();
         \\
         \\
     , .{ pkg.namespace, pkg.name, ver_at, ver_str, world.name });
@@ -3085,7 +3365,9 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         if (entry.is_use_alias) {
             try w.writeAll("pub const ");
             try zigIdent(w, entry.td.name);
-            try w.print(" = {s}.types.", .{entry.source_iface_prefix});
+            try w.writeAll(" = _root.");
+            try zigIdent(w, entry.source_iface_prefix);
+            try w.writeAll(".types.");
             try zigIdent(w, entry.source_name);
             try w.writeAll(";\n");
         } else try emitTypeDecl(w, &resolver, entry.td);
@@ -3099,6 +3381,8 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
                 const saved = resolver.type_scope;
                 resolver.type_scope = e.name;
                 defer resolver.type_scope = saved;
+                resolver.current_export = e.name;
+                defer resolver.current_export = "";
                 for (iface.funcs) |f| {
                     const prefix = try std.fmt.allocPrint(gpa, "{s}_{s}", .{ e.name, f.name });
                     defer gpa.free(prefix);
@@ -3112,6 +3396,10 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
                 const saved = resolver.type_scope;
                 resolver.type_scope = scope;
                 defer resolver.type_scope = saved;
+                const wasm_iface = try externModuleName(gpa, e, lookup);
+                defer gpa.free(wasm_iface);
+                resolver.current_export = wasm_iface;
+                defer resolver.current_export = "";
                 const local = externLocalName(e, lookup);
                 for (lookup.iface.funcs) |f| {
                     const prefix = try std.fmt.allocPrint(gpa, "{s}_{s}", .{ local, f.name });
@@ -3183,8 +3471,8 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         for (resolver.entries.items) |entry| {
             if (!entry.is_use_alias) continue;
             if (entry.source_iface_prefix.len == 0) continue;
-            if (entry.iface_prefix.len != 0 and !containsString(&emitted_structs, entry.iface_prefix)) continue;
-            if (containsString(&emitted_structs, entry.source_iface_prefix)) continue;
+            if (entry.iface_prefix.len != 0 and !containsString(emitted_structs.items, entry.iface_prefix)) continue;
+            if (containsString(emitted_structs.items, entry.source_iface_prefix)) continue;
             const owner = (try findInterfaceByPrefix(gpa, &pkg, entry.source_iface_prefix)) orelse continue;
             try emitInterfaceTypesOnly(w, &resolver, entry.source_iface_prefix, owner.pkg.namespace, owner.pkg.name);
             try emitted_structs.append(gpa, try gpa.dupe(u8, entry.source_iface_prefix));
@@ -3201,7 +3489,7 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         for (flat_world.externs) |e| {
             if (e.kind != .import) continue;
             if (e.body != .func) continue;
-            try emitImportDecl(w, &resolver, e.name, e.body.func, opts);
+            try emitImportDecl(w, &resolver, e.name, e.name, e.body.func, opts);
         }
         try w.writeAll("};\n\n");
     }
@@ -3209,13 +3497,13 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
     try w.writeAll(
         \\/// Reference to the user's `wit_exports` namespace declared
         \\/// in the root source file.
-        \\const exports = @import("root").wit_exports;
+        \\const _exports = @import("root").wit_exports;
         \\
         \\/// Backing arena for `cabi_realloc`.
-        \\var realloc_state: abi.Realloc = .init(std.heap.wasm_allocator);
+        \\var _realloc_state: _abi.Realloc = .init(_std.heap.wasm_allocator);
         \\
         \\export fn cabi_realloc(old_ptr: ?*anyopaque, old_size: usize, alignment: u32, new_size: usize) ?*anyopaque {
-        \\    return realloc_state.realloc(old_ptr, old_size, alignment, new_size);
+        \\    return _realloc_state.realloc(old_ptr, old_size, alignment, new_size);
         \\}
         \\
         \\
@@ -3225,11 +3513,17 @@ pub fn generateWorld(gpa: Allocator, pkg: wit.Package, world: wit.World, opts: O
         if (e.kind != .@"export") continue;
         switch (e.body) {
             .func => |f| try emitCabiExport(w, &resolver, e.name, e.name, e.name, f),
-            .inline_interface => |iface| try emitInlineInterfaceExports(w, &resolver, e.name, e.name, iface),
+            .inline_interface => |iface| {
+                resolver.current_export = e.name;
+                defer resolver.current_export = "";
+                try emitInlineInterfaceExports(w, &resolver, e.name, e.name, iface);
+            },
             .plain => |p| {
                 const lookup = findInterface(&pkg, p) orelse continue;
                 const wasm_iface = try externModuleName(gpa, e, lookup);
                 defer gpa.free(wasm_iface);
+                resolver.current_export = wasm_iface;
+                defer resolver.current_export = "";
                 const scope = try ifacePrefixAlloc(gpa, lookup.pkg.*, lookup.iface.name);
                 defer gpa.free(scope);
                 try emitInterfaceExports(w, &resolver, lookup.iface.*, wasm_iface, externLocalName(e, lookup), scope);
@@ -3292,8 +3586,8 @@ fn emitIfaceTypesBlock(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8)
         if (!std.mem.eql(u8, entry.iface_prefix, this_prefix)) continue;
         try w.writeAll("        pub const ");
         try zigIdent(w, entry.td.name);
-        try w.writeAll(" = ");
-        try w.writeAll(entry.source_iface_prefix);
+        try w.writeAll(" = _root.");
+        try zigIdent(w, entry.source_iface_prefix);
         try w.writeAll(".types.");
         try zigIdent(w, entry.source_name);
         try w.writeAll(";\n");
@@ -3304,11 +3598,13 @@ fn emitIfaceTypesBlock(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8)
             try emitTypeDecl(w, r, entry.td);
         }
     }
-    try w.writeAll("    };\n\n");
+    try w.writeAll("    };\n");
+    // Neither WIT members nor an interface named `types` can shadow this alias.
+    try w.writeAll("    const _types = @This().types;\n\n");
 }
 
-fn containsString(list: *const std.ArrayList([]u8), s: []const u8) bool {
-    for (list.items) |item| {
+fn containsString(list: []const []const u8, s: []const u8) bool {
+    for (list) |item| {
         if (std.mem.eql(u8, item, s)) return true;
     }
     return false;
@@ -3336,7 +3632,7 @@ fn findInterfaceByPrefix(gpa: Allocator, pkg: *const wit.Package, prefix: []cons
 /// already exists under `prefix` or the interface has no types.
 /// Appends the prefix to `emitted` when it writes something.
 fn maybeEmitTypesOnly(w: *std.Io.Writer, r: *Resolver, emitted: *std.ArrayList([]u8), prefix: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
-    if (containsString(emitted, prefix)) return;
+    if (containsString(emitted.items, prefix)) return;
     var has_types = false;
     for (r.entries.items) |entry| {
         if (std.mem.eql(u8, entry.iface_prefix, prefix)) {
@@ -3349,9 +3645,7 @@ fn maybeEmitTypesOnly(w: *std.Io.Writer, r: *Resolver, emitted: *std.ArrayList([
     try emitted.append(r.gpa, try r.gpa.dupe(u8, prefix));
 }
 
-/// Struct holding only the types of an exported interface. Export
-/// thunks reference them as `<prefix>.types.<name>`, so the struct
-/// must exist even without import wrappers.
+/// Exported types and handle helpers need a namespace even without import wrappers.
 fn emitInterfaceTypesOnly(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
     try w.writeAll("pub const ");
     try zigIdent(w, this_prefix);
@@ -3359,7 +3653,59 @@ fn emitInterfaceTypesOnly(w: *std.Io.Writer, r: *Resolver, this_prefix: []const 
     const scope = r.enterIface(this_prefix, pkg_ns, pkg_name);
     defer scope.deinit();
     try emitIfaceTypesBlock(w, r, this_prefix);
+    try emitExportedResourceHelpers(w, r, this_prefix);
     try w.writeAll("};\n\n");
+}
+
+fn emitExportedResourceHelpers(w: *std.Io.Writer, r: *Resolver, this_prefix: []const u8) Error!void {
+    // Registration keeps each export's resources contiguous.
+    var open: ?[]const u8 = null;
+    for (r.exported_resources.items) |er| {
+        if (!std.mem.eql(u8, er.iface_prefix, this_prefix)) continue;
+        if (open == null or !std.mem.eql(u8, open.?, er.wasm_iface)) {
+            if (open != null) try w.writeAll("    };\n");
+            try w.writeAll("    pub const ");
+            try er.writeHelpersNamespace(w);
+            try w.writeAll(" = struct {\n");
+            open = er.wasm_iface;
+        }
+        try emitResourceHelpers(w, er);
+    }
+    if (open != null) try w.writeAll("    };\n");
+}
+
+fn emitResourceHelpers(w: *std.Io.Writer, er: ExportedResource) Error!void {
+    try w.writeAll("        pub const ");
+    try zigIdent(w, er.name);
+    try w.writeAll(" = struct {\n");
+    try w.writeAll("            const State = ");
+    try er.writeImplPath(w);
+    try w.writeAll(".State;\n");
+    try w.print(
+        \\            const _new = @extern(*const fn (i32) callconv(.c) i32, .{{ .name = "[resource-new]{0s}", .library_name = "[export]{1s}" }});
+        \\            const _rep = @extern(*const fn (i32) callconv(.c) i32, .{{ .name = "[resource-rep]{0s}", .library_name = "[export]{1s}" }});
+        \\            const _drop = @extern(*const fn (i32) callconv(.c) void, .{{ .name = "[resource-drop]{0s}", .library_name = "[export]{1s}" }});
+        \\
+    , .{ er.name, er.wasm_iface });
+    try w.writeAll("            /// Create an owned handle for `state`.\n");
+    try w.writeAll("            /// Each handle runs `destructor` when dropped; never wrap the same state twice.\n");
+    try w.writeAll("            pub fn new(state: *State) ");
+    try emitIfaceTypePath(w, er.name);
+    try w.writeAll(" {\n                return @enumFromInt(@as(u32, @bitCast(_new.*(@bitCast(@as(u32, @intCast(@intFromPtr(state))))))));\n            }\n");
+    try w.writeAll("            /// The state behind an owned handle.\n");
+    try w.writeAll("            pub fn rep(self: ");
+    try emitIfaceTypePath(w, er.name);
+    try w.writeAll(") *State {\n                return @ptrFromInt(@as(usize, @as(u32, @bitCast(_rep.*(@bitCast(@intFromEnum(self)))))));\n            }\n");
+    try w.writeAll("            /// Drop an owned handle, which runs `destructor` on its state.\n");
+    try w.writeAll("            pub fn drop(self: ");
+    try emitIfaceTypePath(w, er.name);
+    try w.writeAll(") void {\n                _drop.*(@bitCast(@intFromEnum(self)));\n            }\n");
+    try w.writeAll("        };\n");
+}
+
+fn emitIfaceTypePath(w: *std.Io.Writer, name: []const u8) Error!void {
+    try w.writeAll("_types.");
+    try zigIdent(w, name);
 }
 
 fn emitInterfaceImports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, wasm_iface: []const u8, pkg_ns: []const u8, pkg_name: []const u8) Error!void {
@@ -3370,7 +3716,7 @@ fn emitInterfaceImports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, w
 
     try emitDocs(w, iface.docs, "");
     try w.writeAll("pub const ");
-    try w.writeAll(this_prefix);
+    try zigIdent(w, this_prefix);
     try w.writeAll(" = struct {\n");
     const scope = r.enterIface(this_prefix, pkg_ns, pkg_name);
     defer scope.deinit();
@@ -3392,7 +3738,9 @@ fn emitInterfaceImports(w: *std.Io.Writer, r: *Resolver, iface: wit.Interface, w
     }
     if (any_res) try w.writeAll("    };\n");
     for (iface.funcs) |f| {
-        try emitImportDecl(w, r, f.name, f, .{ .import_module = wasm_iface });
+        const zig_name = try memberNameAlloc(r.gpa, f.name, iface_reserved_names);
+        defer r.gpa.free(zig_name);
+        try emitImportDecl(w, r, f.name, zig_name, f, .{ .import_module = wasm_iface });
     }
     try w.writeAll("};\n\n");
 }
@@ -3489,8 +3837,8 @@ fn emitUseAliases(w: *std.Io.Writer, r: *Resolver, uses: []const wit.Use) Error!
             const local_name = it.alias orelse it.name;
             try w.writeAll("        pub const ");
             try zigIdent(w, local_name);
-            try w.writeAll(" = ");
-            try w.writeAll(src_prefix);
+            try w.writeAll(" = _root.");
+            try zigIdent(w, src_prefix);
             try w.writeAll(".types.");
             try zigIdent(w, it.name);
             try w.writeAll(";\n");
@@ -3569,7 +3917,9 @@ fn emitInlineInterfaceImports(w: *std.Io.Writer, r: *Resolver, name: []const u8,
     }
     if (any_res) try w.writeAll("    };\n");
     for (iface.funcs) |f| {
-        try emitImportDecl(w, r, f.name, f, .{ .import_module = name });
+        const zig_name = try memberNameAlloc(r.gpa, f.name, iface_reserved_names);
+        defer r.gpa.free(zig_name);
+        try emitImportDecl(w, r, f.name, zig_name, f, .{ .import_module = name });
     }
     try w.writeAll("};\n\n");
 }
@@ -3588,11 +3938,14 @@ fn emitResourceImports(w: *std.Io.Writer, r: *Resolver, wasm_iface: []const u8, 
         try w.writeAll("        const _drop = @extern(*const fn (i32) callconv(.c) void, .{");
         try w.print(" .name = \"{s}\", .library_name = \"{s}\" ", .{ drop_name, wasm_iface });
         try w.writeAll("});\n");
-        try w.writeAll("        pub fn drop(self: types.");
-        try zigIdent(w, res_name);
+        try w.writeAll("        pub fn drop(self: ");
+        try emitIfaceTypePath(w, res_name);
         try w.writeAll(") void { _drop.*(@bitCast(@intFromEnum(self))); }\n");
     }
 
+    const has_constructor = for (members) |m| {
+        if (m.kind == .constructor) break true;
+    } else false;
     for (members) |m| {
         const tag = switch (m.kind) {
             .constructor => "[constructor]",
@@ -3605,15 +3958,16 @@ fn emitResourceImports(w: *std.Io.Writer, r: *Resolver, wasm_iface: []const u8, 
             try std.fmt.allocPrint(r.gpa, "{s}{s}.{s}", .{ tag, res_name, m.func.name });
         defer r.gpa.free(wasm_member_name);
 
-        const zig_fn_name = if (m.kind == .constructor) "new" else m.func.name;
+        const zig_fn_name = if (m.kind == .constructor)
+            try r.gpa.dupe(u8, "new")
+        else
+            try memberNameAlloc(r.gpa, m.func.name, if (has_constructor) &.{ "new", "drop" } else &.{"drop"});
+        defer r.gpa.free(zig_fn_name);
         try emitResourceMemberImport(w, r, wasm_iface, wasm_member_name, zig_fn_name, res_name, m);
 
-        // Stream/future intrinsics for this member, nested inside the
-        // resource's method namespace (`<iface>.resources.<res>.
-        // intrinsics_<member>.stream0` etc). The canonical intrinsic
-        // link name suffixes the full member name, e.g.
-        // `[stream-new-0][method]descriptor.read-via-stream`.
-        try emitFuncStreamFutureIntrinsics(w, r, wasm_iface, wasm_member_name, zig_fn_name, m.func);
+        // WIT names keep intrinsic namespaces distinct from renamed methods.
+        const ns_base = if (m.kind == .constructor) "constructor" else m.func.name;
+        try emitFuncStreamFutureIntrinsics(w, r, wasm_iface, wasm_member_name, ns_base, m.func);
     }
     try w.writeAll("    };\n");
 }
@@ -3676,8 +4030,8 @@ fn emitResourceMemberImport(
     try zigIdent(w, zig_fn_name);
     try w.writeAll("(");
     if (m.kind == .method) {
-        try w.writeAll("self: types.");
-        try zigIdent(w, res_name);
+        try w.writeAll("self: ");
+        try emitIfaceTypePath(w, res_name);
         if (f.params.len != 0) try w.writeAll(", ");
     }
     for (f.params, 0..) |p, i| {
@@ -3688,8 +4042,7 @@ fn emitResourceMemberImport(
     }
     try w.writeAll(") ");
     if (m.kind == .constructor) {
-        try w.writeAll("types.");
-        try zigIdent(w, res_name);
+        try emitIfaceTypePath(w, res_name);
     } else if (f.results.len == 0) {
         try w.writeAll("void");
     } else {
@@ -3915,7 +4268,7 @@ fn findWorldWithPkg(pkg: *const wit.Package, path: wit.PackagePath) ?WorldLookup
 ///   * `<iface>#[constructor]<res>`  → returns an i32 rep
 ///   * `<iface>#[method]<res>.<m>`   → takes rep as first param
 ///   * `<iface>#[static]<res>.<m>`   → no implicit rep
-///   * `<iface>#[dtor]<res>`         → called when the last own handle dies
+///   * `<iface>#[dtor]<res>`         → called when an owned handle is dropped
 ///
 /// The user implements each as `wit_exports.<iface>.<res>.<m>(...)`.
 /// The rep is whatever the constructor returns (commonly a `*T`),
@@ -3998,13 +4351,13 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
             try w.writeAll(flat_results.items[0].zigName());
         }
         try w.writeAll(" {\n");
-        try w.writeAll("    realloc_state.enterTask();\n");
+        try w.writeAll("    _realloc_state.enterTask();\n");
 
         if (indirect_params) {
             try w.writeAll("    const _args_base: usize = @intCast(@as(u32, @bitCast(args_ptr)));\n");
             var offset: u32 = 0;
             if (m.kind == .method) {
-                try w.writeAll("    const _self: *exports.");
+                try w.writeAll("    const _self: *_exports.");
                 try zigIdent(w, iface_name);
                 try w.writeAll(".");
                 try zigIdent(w, res_name);
@@ -4020,7 +4373,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
         } else {
             var arg_start: usize = 0;
             if (m.kind == .method) {
-                try w.writeAll("    const _self: *exports.");
+                try w.writeAll("    const _self: *_exports.");
                 try zigIdent(w, iface_name);
                 try w.writeAll(".");
                 try zigIdent(w, res_name);
@@ -4034,7 +4387,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
         }
 
         if (m.kind == .constructor) {
-            try w.writeAll("    const _result = exports.");
+            try w.writeAll("    const _result = _exports.");
             try zigIdent(w, iface_name);
             try w.writeAll(".");
             try zigIdent(w, res_name);
@@ -4044,19 +4397,18 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
                 try emitParamName(w, p.name);
             }
             try w.writeAll(");\n");
-            // Wrap the rep in a handle via the canonical-ABI's
-            // `[resource-new]<T>` host import. Constructors have no
-            // post-return hook, so the task retires inline — the
-            // returned handle is a scalar and needs no arena data.
+            try emitParamBorrowDrops(w, r, f.params);
+            // Constructors have no post-return hook and retain no arena data,
+            // so release the task here.
             try w.writeAll("    const _rep: i32 = @bitCast(@as(u32, @intCast(@intFromPtr(_result))));\n");
             try w.print("    const _handle = @\"_resource_new_{s}#{s}\"", .{ wasm_iface, res_name });
             try w.writeAll(".*(_rep);\n");
-            try w.writeAll("    realloc_state.exitTask();\n");
+            try w.writeAll("    _realloc_state.exitTask();\n");
             try w.writeAll("    return _handle;\n");
         } else {
             try w.writeAll("    ");
             if (f.results.len != 0) try w.writeAll("const _result = ");
-            try w.writeAll("exports.");
+            try w.writeAll("_exports.");
             try zigIdent(w, iface_name);
             try w.writeAll(".");
             try zigIdent(w, res_name);
@@ -4072,6 +4424,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
                 try emitParamName(w, p.name);
             }
             try w.writeAll(");\n");
+            try emitParamBorrowDrops(w, r, f.params);
             if (f.results.len != 0) {
                 if (flat_results.items.len == 0) {
                     try w.writeAll("    _ = _result;\n");
@@ -4096,9 +4449,7 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
         }
     }
 
-    // Auto-emit the `[dtor]` export wit-component wires as the
-    // resource type's destructor; the runtime invokes it with the rep
-    // when the last own handle drops.
+    // The runtime passes the resource's rep to this destructor.
     try w.writeAll("export fn ");
     {
         var buf: std.ArrayList(u8) = .empty;
@@ -4110,16 +4461,14 @@ fn emitResourceExports(w: *std.Io.Writer, r: *Resolver, iface_zig_name: []const 
         try zigExportIdent(w, buf.items);
     }
     try w.writeAll("(p0: i32) void {\n");
-    try w.writeAll("    const _self: *exports.");
+    try w.writeAll("    const _Impl = _exports.");
     try zigIdent(w, iface_name);
     try w.writeAll(".");
     try zigIdent(w, res_name);
-    try w.writeAll(".State = @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(p0)))));\n");
-    try w.writeAll("    exports.");
-    try zigIdent(w, iface_name);
-    try w.writeAll(".");
-    try zigIdent(w, res_name);
-    try w.writeAll(".destructor(_self);\n");
+    try w.writeAll(";\n");
+    try w.writeAll("    if (@hasDecl(_Impl, \"destructor\")) {\n");
+    try w.writeAll("        _Impl.destructor(@as(*_Impl.State, @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(p0)))))));\n");
+    try w.writeAll("    }\n");
     try w.writeAll("}\n\n");
 }
 
@@ -4204,10 +4553,10 @@ test "import of an interface with a resource generates wrappers" {
     defer testing.allocator.free(src);
     try testing.expect(std.mem.indexOf(u8, src, "pub const demo_x_counters = struct {") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub const counter = struct {") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "pub fn new(_a_initial: u32) types.counter") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "pub fn increment(self: types.counter)") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "pub fn get(self: types.counter) u32") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "pub fn drop(self: types.counter) void") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn new(_a_initial: u32) _types.counter") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn increment(self: _types.counter)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn get(self: _types.counter) u32") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn drop(self: _types.counter) void") != null);
     try testing.expect(std.mem.indexOf(u8, src, ".name = \"[constructor]counter\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, ".name = \"[method]counter.increment\"") != null);
 }
@@ -4398,9 +4747,9 @@ test "async export emits [async-lift]/[callback]/[task-return] trio" {
     // The callback chains back through async_cleanup so multi-step
     // producers can re-schedule themselves from inside the cleanup,
     // and the task's arena share is only released on EXIT.
-    try testing.expect(std.mem.indexOf(u8, src, "_ = abi.async_cleanup.run();") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "const _outcome = abi.async_cleanup.lift_outcome();") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "if (_outcome == 0) realloc_state.exitTask();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "_ = _abi.async_cleanup.run();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const _outcome = _abi.async_cleanup.lift_outcome();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "if (_outcome == 0) _realloc_state.exitTask();") != null);
 }
 
 test "async export emits typed state-machine dispatch and taskReturn thunk" {
@@ -4421,7 +4770,7 @@ test "async export emits typed state-machine dispatch and taskReturn thunk" {
     // can hand its address to a `*const fn(R) void` parameter.
     try testing.expect(std.mem.indexOf(u8, src, "fn _task_return_helper_demo_x_kit_0_1_0_greet(_value: u32) void") != null);
     // The [async-lift] dispatches on the user's export shape at comptime.
-    try testing.expect(std.mem.indexOf(u8, src, "if (comptime @typeInfo(@TypeOf(exports.kit.greet)) == .type)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "if (comptime @typeInfo(@TypeOf(_exports.kit.greet)) == .type)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "_Sm.start(_state, &_task_return_helper_demo_x_kit_0_1_0_greet, _a_name)") != null);
     // Step dispatch: .exit frees + EXIT, .yield -> 1, .wait -> WAIT(set).
     try testing.expect(std.mem.indexOf(u8, src, ".exit => {") != null);
@@ -4429,7 +4778,7 @@ test "async export emits typed state-machine dispatch and taskReturn thunk" {
     try testing.expect(std.mem.indexOf(u8, src, ".yield => return 1,") != null);
     try testing.expect(std.mem.indexOf(u8, src, ".wait => |_set| return @as(i32, @bitCast(@as(u32, 2) | (_set << 4))),") != null);
     // The [callback] dispatches via Sm.step with the lifted event triple.
-    try testing.expect(std.mem.indexOf(u8, src, "_Sm.step(_state, @as(abi.Event, @enumFromInt") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "_Sm.step(_state, @as(_abi.Event, @enumFromInt") != null);
 }
 
 test "async export with void result emits zero-param taskReturn thunk" {
@@ -4485,7 +4834,7 @@ test "sync import with stream/future signature emits per-function intrinsics" {
     try testing.expect(std.mem.indexOf(u8, src, "extern \"demo:x/io@0.1.0\" fn @\"[future-read-1]pipe\"(") != null);
     // Compound payloads expose the canonical element layout plus
     // lift/lower so callers can use readRaw/writeRaw buffers.
-    try testing.expect(std.mem.indexOf(u8, src, "pub fn readRaw(handle: abi.Future, ptr: usize) abi.CopyOutcome {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn readRaw(handle: _abi.Future, ptr: usize) _abi.CopyOutcome {") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub fn lift(_base: usize) T {") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub fn lower(_value: T, _base: usize) void {") != null);
 }
@@ -4560,8 +4909,8 @@ test "async export with compound result lowers task.return as flat params" {
     // File-scope cabi glue must reference `use`d cross-interface types
     // through the source interface's struct — the exporting interface
     // has no struct of its own at file scope.
-    try testing.expect(std.mem.indexOf(u8, src, "const _T_a_t = demo_x_deps.types.thing;") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "pub const kit_poke_result = union(enum) { ok: demo_x_deps.types.thing, err: demo_x_deps.types.fault };") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const _T_a_t = _root.demo_x_deps.types.thing;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const kit_poke_result = union(enum) { ok: _root.demo_x_deps.types.thing, err: _root.demo_x_deps.types.fault };") != null);
 }
 
 test "nested variant store lowering uses unique captures" {
@@ -4750,11 +5099,11 @@ test "import wrappers lift single-flat small ints, char, and named types" {
     defer testing.allocator.free(src);
     try testing.expect(std.mem.indexOf(u8, src, "return @as(u8, @truncate(@as(u32, @bitCast(p0))));") != null);
     try testing.expect(std.mem.indexOf(u8, src, "return @as(i8, @truncate(p0));") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "return abi.liftChar(@as(u32, @bitCast(p0)));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "return _abi.liftChar(@as(u32, @bitCast(p0)));") != null);
     // Single-flat record: field-wise lift, not @enumFromInt garbage.
     try testing.expect(std.mem.indexOf(u8, src, "return .{ .x = @as(u32, @bitCast(p0)) };") != null);
     // Payload-less variant: discriminant switch with a trap arm.
-    try testing.expect(std.mem.indexOf(u8, src, "0 => .{ .a = {} }, 1 => .{ .b = {} }, else => abi.trap()") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "0 => .{ .a = {} }, 1 => .{ .b = {} }, else => _abi.trap()") != null);
 }
 
 test "single-flat record and payload-less variant export results lower directly" {
@@ -4809,9 +5158,9 @@ test "char and enum lifts validate through abi helpers" {
     const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
     defer testing.allocator.free(src);
     // Export param: char validated on the flat lift path.
-    try testing.expect(std.mem.indexOf(u8, src, "const _a_c: _T_a_c = abi.liftChar(@as(u32, @bitCast(p0)));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const _a_c: _T_a_c = _abi.liftChar(@as(u32, @bitCast(p0)));") != null);
     // Import result: enum discriminant validated against the case count.
-    try testing.expect(std.mem.indexOf(u8, src, "return abi.liftEnum(color, @as(u32, @bitCast(p0)));") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "return _abi.liftEnum(color, @as(u32, @bitCast(p0)));") != null);
 }
 
 test "sync exports pair enterTask with the post-return exitTask" {
@@ -4825,7 +5174,7 @@ test "sync exports pair enterTask with the post-return exitTask" {
     );
     const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
     defer testing.allocator.free(src);
-    try testing.expect(std.mem.indexOf(u8, src, "export fn greet(p0: i32, p1: i32) i32 {\n    realloc_state.enterTask();") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "export fn greet(p0: i32, p1: i32) i32 {\n    _realloc_state.enterTask();") != null);
     try testing.expect(std.mem.indexOf(u8, src, "realloc_state.exitTask();\n}") != null);
     try testing.expect(std.mem.indexOf(u8, src, "realloc_state.reset()") == null);
 }
@@ -4947,7 +5296,7 @@ test "use sources of emitted structs are emitted transitively" {
         defer testing.allocator.free(src);
         // The alias references `demo_x_deps`, so that struct must
         // exist even though `deps` is neither imported nor exported.
-        try testing.expect(std.mem.indexOf(u8, src, "= demo_x_deps.types.item;") != null);
+        try testing.expect(std.mem.indexOf(u8, src, "= _root.demo_x_deps.types.item;") != null);
         try testing.expect(std.mem.indexOf(u8, src, "pub const demo_x_deps = struct {") != null);
     }
 }
@@ -5057,4 +5406,74 @@ test "kebab names that become C-ABI primitives stay escaped" {
     try testing.expect(std.mem.indexOf(u8, src, "exports.k.@\"c_char\"(") != null);
     // Names that need no escape must not gain one.
     try testing.expect(std.mem.indexOf(u8, src, "@\"demo_prim_k\"") == null);
+}
+
+test "own-resource borrows resolve to the export that receives them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package test:two;
+        \\interface i {
+        \\  resource r { constructor(v: u32); }
+        \\  look: func(x: borrow<r>) -> u32;
+        \\}
+        \\world w {
+        \\  export first: i;
+        \\  export second: i;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    const second = std.mem.indexOf(u8, src, "export fn @\"second#look\"").?;
+    try testing.expect(std.mem.indexOf(u8, src[second..], "const _T_a_x = *_exports.second.r.State;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const resources_first = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const resources_second = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".library_name = \"[export]second\"") != null);
+}
+
+test "a resource named types keeps its helpers unambiguous" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package test:tys;
+        \\interface i {
+        \\  resource types { constructor(); get: func() -> u32; }
+        \\}
+        \\world w {
+        \\  import i;
+        \\  export i;
+        \\}
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn drop(self: _types.types)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub fn get(self: _types.types)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "self: types.types") == null);
+}
+
+test "intrinsics namespaces follow WIT names and never meet escaped members" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const pkg = try wit.parse(arena.allocator(),
+        \\package test:intr;
+        \\interface i {
+        \\  resource r {
+        \\    constructor(s: stream<u8>);
+        \\    new: static func() -> stream<u8>;
+        \\    drop: func() -> stream<u8>;
+        \\    intrinsics-drop: func();
+        \\  }
+        \\}
+        \\world w { import i; }
+    );
+    const src = try generateWorld(testing.allocator, pkg, pkg.worlds[0], .{});
+    defer testing.allocator.free(src);
+    for ([_][]const u8{
+        "pub const intrinsics_constructor = struct {",
+        "pub const intrinsics_new = struct {",
+        "pub const intrinsics_drop = struct {",
+        "pub fn new_() _abi.Stream {",
+        "pub fn drop_(self: _types.r) _abi.Stream {",
+        "pub fn intrinsics_drop_(self: _types.r) void {",
+    }) |needle| try testing.expect(std.mem.indexOf(u8, src, needle) != null);
 }

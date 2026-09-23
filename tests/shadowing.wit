@@ -1,0 +1,49 @@
+package test:shadowing;
+
+// Exercise name shadowing in both imported and exported bindings.
+world provider {
+  export foo: interface {
+    resource foo {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    resource types {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    make: func(v: u32) -> types;
+  }
+  export types: interface {
+    record pt { x: u32 }
+    resource r {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    make: func(p: pt) -> r;
+    types: func(p: pt) -> u32;
+  }
+}
+
+world demo {
+  import foo: interface {
+    resource foo {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    resource types {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    make: func(v: u32) -> types;
+  }
+  import types: interface {
+    record pt { x: u32 }
+    resource r {
+      constructor(v: u32);
+      get: func() -> u32;
+    }
+    make: func(p: pt) -> r;
+    types: func(p: pt) -> u32;
+  }
+  export run: func() -> u32;
+}
