@@ -1,0 +1,11 @@
+package test:fixed-lists;
+interface api {
+  variant pair { single(u32), quad(list<u32, 2>), wide(list<u64, 3>), mixed(list<tuple<u8, string>, 2>) }
+  echo: func(x: pair) -> pair;
+  echo-opt: func(x: option<list<f32, 2>>) -> option<list<f32, 2>>;
+}
+world provider { export api; }
+world demo {
+  import api;
+  export run: func() -> bool;
+}
