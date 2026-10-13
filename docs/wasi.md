@@ -21,9 +21,10 @@ zig_wasi_components gen resolved.wit <world-name> > bindings.zig
 ```
 
 `wasm-tools component wit` walks the directory and resolves every
-`use foo:bar/baz` reference. It prints the world and every transitive
-dependency as a single multi-package WIT document. The generator
-handles this block form natively.
+`use foo:bar/baz` reference.
+It prints your package plus every package found under `deps/` as a
+single multi-package WIT document, whether your world uses them or not.
+The generator handles this block form natively.
 
 The `<wit-dir>` argument must point at a directory. Its top level must
 be the package that declares your world. Place WASI dependencies in a
@@ -85,9 +86,11 @@ wasm-tools component wit tmp/hello-wasi > tmp/hello-wasi-resolved.wit
   > tmp/hello-wasi/bindings.zig
 ```
 
-The flattened file is about 50KB. The generated bindings are larger.
-Most of their surface comes from the transitive wasi-io stream API and
-wasi-clocks pollable plumbing.
+The flattened file is about 135 KB, mostly doc comments.
+The generated bindings come to about 230 KB.
+Most of that is `wasi:filesystem` and `wasi:sockets`, which
+`include wasi:cli/imports` pulls in, followed by the `wasi:io` stream
+API.
 
 Keep the resolved file *outside* the WIT package directory. If you
 place it inside `tmp/hello-wasi/`, the next `wasm-tools component
@@ -100,9 +103,9 @@ tree.
 
 ### 4. Implement `run`
 
-A `wasi:cli/run` export is a method on the `run` interface. Its
-function name in `wit_exports` uses the interface's bare name (`run`).
-It does not use the fully qualified WIT path:
+`wasi:cli/run` is an interface with a single `run` function.
+In `wit_exports`, the interface becomes a nested struct named after its
+bare name (`run`), not the fully qualified WIT path:
 
 ```zig
 const std = @import("std");
@@ -125,9 +128,9 @@ pub const wit_exports = struct {
 };
 ```
 
-The generator emits exact names such as
-`bindings.run_run_result`, the nested `wit_exports.run.run`, and the
-`wasi_cli_stdout` / `wasi_io_streams` module paths.
+The generator emits names such as `bindings.run_run_result` and the
+`wasi_cli_stdout` / `wasi_io_streams` namespaces.
+It expects you to declare `wit_exports.run.run`.
 
 Open `bindings.zig` after step 3 to confirm a name. Type definitions
 are at the top. The `wit_exports` reference and `export fn` block are
@@ -163,9 +166,11 @@ wasmtime run tmp/hello-wasi/hello.component.wasm
 # => hello from zig
 ```
 
-`wasm-tools component embed` takes the *directory*, not the flattened
-resolved file. It needs `--world demo:hellowasi/hello-wasi` to select
-the world and package to embed.
+`wasm-tools component embed` accepts either the directory or the
+flattened file.
+`--world demo:hellowasi/hello-wasi` names the world explicitly.
+You can leave it out when your package declares a single world, but
+spelling it out keeps the command working once you add a second one.
 
 ## Generating bindings for just one interface
 
@@ -188,29 +193,40 @@ world udp-only {
 }
 EOF
 
-wasm-tools component wit tmp/udp > tmp/udp/resolved.wit
-./zig-out/bin/zig_wasi_components gen tmp/udp/resolved.wit udp-only \
-  > tmp/udp/bindings.zig
+wasm-tools component wit tmp/udp > tmp/udp-resolved.wit
+./zig-out/bin/zig_wasi_components gen tmp/udp-resolved.wit udp-only \
+  > tmp/udp-bindings.zig
 ```
 
 The result includes the UDP socket type, IP address structs, and the
-network handle. It also includes host-import wrappers for every
-method. No unrelated wasi-http or wasi-cli surface is included.
+network handle, plus the `wasi:io/poll` pollable they depend on.
+It also includes host-import wrappers for every method.
+No unrelated wasi-http or wasi-cli surface is included.
+
+As in the previous section, the resolved file stays outside `tmp/udp/`.
+Otherwise the next `wasm-tools component wit tmp/udp` fails with
+`duplicate item named udp-only`.
 
 ## Why interface-only WIT files do not work directly
 
 Passing an interface file to `gen` returns `WorldNotFound`.
-Examples include `wasi/sockets/udp.wit` and `wasi/io/streams.wit`.
-The generator operates on a world. WIT interface files declare
-interfaces. Only world files declare worlds.
+Examples include `deps/sockets/udp.wit` and `deps/io/streams.wit`.
+The generator operates on a world.
+WIT interface files declare interfaces.
+Only world files declare worlds.
 
-The CLI lists available worlds and interfaces in its error. It also
-suggests using `dump` to inspect the file.
+When the file declares no worlds, the CLI lists its interfaces and
+suggests running `dump` on it.
+When it does declare worlds, the error lists those instead.
 
-Even a file that contains a world can depend on `wasi:io` types from
-other files. Without flattening, the generator reports type-not-found
-errors. Always pass a world file that already inlines dependencies or
-the multi-package output from `wasm-tools component wit`.
+Even a file that contains a world usually refers to other packages.
+Without flattening, `gen` fails with `error: UnknownType` as soon as
+something `use`s a type from another package.
+Worse, a world that only imports or exports foreign interfaces
+generates without complaint, and every one of those imports and
+exports is silently left out.
+Always pass a world file that already inlines its dependencies, or the
+multi-package output of `wasm-tools component wit`.
 
 ## What about WIT format conversion?
 
