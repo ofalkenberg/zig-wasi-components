@@ -1,93 +1,100 @@
 # Troubleshooting
 
-These are the errors you are most likely to hit. Each includes a plain
-English translation and a concrete fix. The first section covers code
-generator errors. The second covers `wasm-tools` errors. The third
-covers Wasmtime and Rust host runtime failures.
+These are the errors you're most likely to hit, with a plain English explanation and a concrete fix for each.
+The first section covers code generator errors, the second covers `wasm-tools` errors, and the third covers Wasmtime and Rust host runtime failures.
 
 ## Code generator errors
 
 ### `error: world '<name>' not found in <file>`
 
-The world name you passed does not appear in the file. The CLI prints
-the full list of worlds immediately after the error. If there are no
-worlds, it prints the list of interfaces. This helps you see what is
-available. Two common causes are:
+The world name you passed doesn't appear in the file.
+The CLI prints the full list of worlds immediately after the error, or the list of interfaces if there are no worlds.
+That lets you see what's available.
 
-- **The argument is a namespaced path.** WIT worlds are referenced
-  externally as `pkg:name/world`, but `gen` takes the bare
-  identifier. Pass just `world`.
-- **The file has only interfaces.** Interface files are not worlds.
-  Use `dump` to inspect the file. Then write a world that imports the
-  interface, or pick a file that already declares one.
+There are two common causes:
 
-### `error.MissingArgument`
+- **The argument is a namespaced path.** WIT worlds are referenced externally as `pkg:name/world`, but `gen` takes the bare identifier.
+  Pass just `world`.
+- **The file has only interfaces.** Interface files aren't worlds.
+  Use `dump` to inspect the file.
+  Then write a world that imports the interface, or pick a file that already declares one.
 
-`gen` needs three arguments: the subcommand, the file, and the world
-name. The error is generic. Check the command line that you ran.
+### `error: MissingArgument`
 
-### Parse errors from the WIT file
+`dump` needs a file, and `gen` needs a file and a world name.
+Check the command line you ran.
 
-The parser is strict about WIT 0.3-era grammar. It does not always print
-the exact byte offset. It does print the failing token. There are three
-common causes:
+### `error: UnexpectedToken` and other parse errors
 
-- **You forgot the `package <ns>:<name>;` line at the top.** Every
-  WIT file needs one. The error usually mentions an unexpected token
-  where the first real declaration begins.
-- **You used a feature the parser does not know.** This is most likely
-  a WIT 0.4+ grammar addition. Check whether the file works with the
-  reference WIT tooling (`wasm-tools component wit`). If it does not,
-  the source is the problem.
-- **A `use` clause references a package that is not declared in the
-  same file.** The single-file parser does not chase dependencies.
-  Either preflatten with `wasm-tools component wit` or move the type
-  inline.
+`wasm-tools component wit <file>`
+
+Run this to find the line.
+The parser reports what went wrong, but not where; this command parses the same grammar and prints a precise location.
+
+The most likely cause is a WIT feature the parser doesn't know yet.
+If `wasm-tools` rejects the file too, the file itself is the problem.
+
+The parser is also more lenient than `wasm-tools` in a few places.
+For example, a file with no `package <ns>:<name>;` line generates bindings without complaint, and only `wasm-tools component embed` fails later with ``no `package` header was found in any WIT file for this
+package``.
+Add the package line.
+
+### `error: UnknownType`
+
+Something in the file `use`s a type from a package that isn't in the file.
+The generator reads a single file and doesn't follow dependencies.
+Flatten the WIT tree with `wasm-tools component wit` first, as described in [the WASI doc](wasi.md).
+
+### The generated bindings are nearly empty
+
+This has the same root cause as `UnknownType`, but it's quieter.
+If a world imports or exports interfaces from other packages and those packages are missing from the file, you get bindings with just `cabi_realloc` in them.
+Flatten the WIT first.
 
 ## `wasm-tools` errors
 
-### `failed to find import named ...`
+### `failed to find export of function ...`
 
-You renamed an export in the WIT or Zig source without updating the
-other side. One subtle variant occurs when a WIT name has a hyphen. The
-Zig name must use underscores: `format-greeting` ↔ `format_greeting`.
+`wasm-tools component new` expected an export that the core module doesn't have.
+There are two common causes:
 
-Another variant occurs when you forget the
-`comptime { _ = bindings; }` line in your component source. The linker
-then strips the export thunks.
+- **The `comptime { _ = bindings; }` line is missing** from your component source.
+  Without it, Zig never compiles the bindings, and the module has no exports at all.
+- **`bindings.zig` is stale.** You changed an export in the WIT but didn't regenerate the bindings.
+  The same goes for imports, which fail with `failed to resolve import ...`.
 
-### `expected to find a function with signature ... but found ...`
+If you renamed a function on the Zig side only, you won't get this far: the Zig build fails with `has no member named ...`.
+Remember that WIT hyphens become Zig underscores: `format-greeting` is `format_greeting` in `wit_exports`.
 
-The arity, parameter type, or return type of an export does not match
-the WIT declaration. Reread the function signature in the WIT. Then
-reread the corresponding `pub fn` in your `wit_exports`. WIT `u32` maps
-to Zig `u32`. WIT `string` maps to Zig `[]const u8`. WIT `list<T>` maps
-to Zig `[]const T`. The full table is in [bindings.md](bindings.md).
+### `type mismatch for function ...: expected ... but found ...`
+
+The core signature of an export doesn't match the WIT you passed to `embed`.
+The generated thunks always match the WIT they were generated from, so this means `bindings.zig` came from a different version of the WIT.
+Regenerate it.
 
 ### `package '...' not found`
 
-`wasm-tools component wit` was pointed at a directory whose dependencies
-tree lacks a referenced package. For `wasi:sockets`, for example, you
-also need `wasi:io` and `wasi:clocks` in `deps/`. Sockets uses pollables
-from io and time types from clocks.
+You pointed `wasm-tools component wit` at a directory whose dependencies tree is missing a referenced package.
+For `wasi:sockets`, for example, you also need `wasi:io` and `wasi:clocks` in `deps/`.
+Sockets uses pollables from io and time types from clocks.
 
-The simplest fix is to copy the dependencies tree from a bundled
-example. `examples/http-get/wit/deps/` has a complete 0.2.6 set. For
-WASI 0.3, there is no dependencies tree to assemble.
-`examples/wasi-demo-p3/wit/cli.wit` and `wit-http/http.wit` are single,
-fully resolved files. They contain all six packages inline. You can copy
-them and feed them directly to `gen` and `embed`.
+The simplest fix is to copy the dependencies tree from a bundled example.
+`examples/http-get/wit/deps/` has a complete 0.2.6 set.
+
+For WASI 0.3, there's no dependencies tree to assemble.
+These are single, fully resolved files, each with every package its world needs:
+
+- `examples/wasi-demo-p3/wit/cli.wit`
+- `wit-http/http.wit`
+
+You can copy them and feed them directly to `gen` and `embed`.
 
 ### `module requires an import interface named ...` for an `@unstable` item
 
-The generated bindings include items gated with
-`@unstable(feature = ...)`, such as `wasi:clocks/timezone` in WASI
-0.3.2.
-`wasm-tools component embed` hides those items unless the feature is
-enabled, so the world it embeds no longer contains the interface your
-code calls.
-Pass the feature to `embed`, for example
-`--features clocks-timezone`, or use `--all-features`.
+The generated bindings include items gated with `@unstable(feature = ...)`, such as `wasi:clocks/timezone` in WASI 0.3.2.
+`wasm-tools component embed` hides those items unless the feature is enabled, so `component new` then finds a core import that isn't in the embedded world.
+
+Pass the feature to `embed`, for example `--features clocks-timezone`, or use `--all-features`.
 The host must also provide the interface.
 
 Bindings you never call cost nothing.
@@ -95,95 +102,84 @@ Zig only emits imports for functions that are referenced.
 
 ### `the async canonical option requires an async function type`
 
-`wasm-tools component new` refuses an `[async-lower]` import when the
-WIT function is not declared `async`. Sync WASI 0.3 functions that
-return streams or futures, the `*-via-stream` family, must be lowered
-synchronously. The stream handle returns immediately. Only the data
-transfer is asynchronous.
+`wasm-tools component new` refuses an `[async-lower]` import when the WIT function isn't declared `async`.
+Sync WASI 0.3 functions that return streams or futures, the `*-via-stream` family, must be lowered synchronously.
+The stream handle returns immediately; only the data transfer is asynchronous.
 
-The generated bindings already do the right thing. You will only see
-this error if you hand-write an `@extern` with an `[async-lower]` link
-name for a sync-typed WIT function. Drop the prefix.
+The generated bindings already do the right thing.
+You'll only see this error if you write an `@extern` by hand with an `[async-lower]` link name for a sync-typed WIT function.
+Drop the prefix.
 
 ## Wasmtime / runtime errors
 
 ### `unknown handle index <very large number>`
 
-You returned a raw pointer where a resource handle was expected. The
-pointer bits were misinterpreted as a table index. Fix: the constructor
-must return a `*State`. The generator handles the `[resource-new]`
-round-trip. The rest of your code should use the `*State` argument that
-the binding lifts for you. See [resources.md](resources.md) for the full
-pattern.
+A raw pointer was used where a resource handle was expected, so the pointer bits were read as a table index.
+Generated bindings never do this: the constructor thunk turns your `*State` into a handle with `[resource-new]`.
 
-### `invalid expected discriminant`
+You'll only see it with glue code you've written by hand.
+See [resources.md](resources.md) for the pattern the bindings follow.
 
-The host expected a tagged enum, variant, option, or result. It got a
-value that does not match any case. There are two causes:
+### `invalid expected discriminant` and friends
 
-- **You returned an integer where a discriminant was needed.** A WIT
-  export returning `result<T, E>` has a single-`i32` flat
-  representation. `0` is `Ok` and `1` is `Err`. The indirect
-  representation has the discriminant byte at offset 0. Its payload
-  has a fixed offset. If you write the wrong byte, the host rejects
-  it. Use the typed Zig wrapper instead of computing the layout by
-  hand: `return .{ .ok = x };` or `return .{ .err = e };`.
-- **The Zig union(enum) tag does not line up with the WIT case
-  order.** The generator preserves WIT case order. If you reorder
-  cases while editing the generated source, the tags drift.
+Wasmtime read back a `result` whose tag byte doesn't match any case.
+For an `option`, the message is `invalid option discriminant`.
+For a variant or enum, it's `unexpected discriminant: N`.
 
-### `memory access out of bounds` immediately on a call
+The generated thunks always write valid tags, so this almost always means `bindings.zig` is stale: cases were added, removed, or reordered in the WIT, and the bindings weren't regenerated.
+Regenerate them.
+Never edit the generated file by hand.
 
-This usually means the indirect return area was misread. The retarea is
-a fixed-size stack buffer. Its layout matches the canonical layout of
-the return type. If your export returns a slice or string, allocate its
-bytes through `std.heap.wasm_allocator`. You can also use another
-allocator backed by `cabi_realloc`. Otherwise, the host gets a pointer
-to stack memory that is released before it reads it.
+### Garbage or `memory access out of bounds` in a returned string or list
 
-The fix is to allocate every returned string or list with
-`std.heap.wasm_allocator`. The greeter's `format_greeting` is the
-reference example.
+An export returned a slice that no longer points at live memory.
+For example:
+
+- A slice of a local array.
+- A slice of a buffer you already freed.
+
+The host reads the bytes after your function has returned.
+Return static data, or memory from an allocator such as `std.heap.wasm_allocator`.
+The greeter's `format_greeting` is an example.
 
 ### The component runs but produces wrong output
 
-Run `wasm-tools print zig-out/wasm/foo.component.wasm | less` to inspect
-the textual form. The `(component ...)` section at the top lists every
-exported and imported function with its full canonical type. A mismatch
-between that output and your intent is almost always a WIT-to-Zig name
-mapping problem.
+`wasm-tools component wit zig-out/wasm/foo.component.wasm`
 
-### `wasmtime: failed to invoke <function>`
+This prints the interface your component actually exports and imports, as WIT.
+If that output doesn't match what you intended, the cause is usually a stale `bindings.zig` or a build against the wrong world.
 
-For `wasi:http`, this usually means you omitted `-S http=y` from the
-Wasmtime command line. The flag enables the wasi-http implementation.
-Without it, the outbound-request import is not satisfied. The first call
-then traps.
+### `component imports instance wasi:http/..., but a matching implementation was not found`
+
+For a `wasi:http` client, this means you left `-S http=y` out of the Wasmtime command line.
+The flag enables the wasi-http implementation.
+Without it, Wasmtime refuses to instantiate the component.
 
 ### `instance export ... has the wrong type` / `function implementation is missing`
 
-For a WASI 0.3 component, this is almost always a *version identity*
-mismatch. It is not an encoding bug. Wasmtime 46 and later link
-WASI 0.3.2 components directly, with both `wasmtime run -S p3` and
-`wasmtime serve -S p3,cli`.
+For a WASI 0.3 component, first check your `-S` flags: running without `-S p3` (or with `-S p3=n`) gives exactly this error.
+
+If the flags are right, this is a *version identity* mismatch, not an encoding bug.
+Wasmtime 46 and later link WASI 0.3.2 components directly, with both `wasmtime run -S p3` and `wasmtime serve -S p3,cli`.
 
 Wasmtime 45 and earlier vendor the `0.3.0-rc-2026-03-15` interfaces.
-Their shapes match the final release. However, named types such as
-`error-code` carry their interface version in their type identity. A
-WASI 0.3.2 component therefore fails to link every host function whose
-signature mentions one.
+Their shapes match the final release, but named types such as `error-code` carry their interface version in their type identity.
+So a WASI 0.3.2 component fails to link every host function whose signature mentions one.
 
-Before suspecting the bindings, compare the version strings. On an old
-runtime, fetch its vendored WIT from
-`crates/wasi/src/p3/wit/deps/*.wit` in the wasmtime repository.
-Regenerate the bindings from it. Then rebuild the otherwise identical
-guest.
+Before suspecting the bindings, compare the version strings.
+On an old runtime, fetch its vendored WIT from `crates/wasi/src/p3/wit/deps/*.wit` in the wasmtime repository.
+Regenerate the bindings from it, then rebuild the otherwise identical guest.
 
-### `synchronous future.read requires the component model more async builtins feature`
+### `synchronous stream.write requires the component model more async builtins feature`
 
-The sync `stream.read` and `future.read` canon builtins sit behind their
-own Wasmtime feature gate. The generated typed intrinsics and the
-`wasi3` module rely on them. Run WASI 0.3 components with both flags:
+The message can also name:
+
+- `stream.read`
+- `future.read`
+- `future.write`
+
+The synchronous stream and future canon builtins have their own Wasmtime feature gate, and the generated typed intrinsics and the `wasi3` module rely on them.
+Wasmtime refuses to load the component without it.
 
 ```sh
 wasmtime run -S p3 \
@@ -191,20 +187,14 @@ wasmtime run -S p3 \
     --invoke 'run()' my.component.wasm
 ```
 
+Run WASI 0.3 components with both flags, as shown above.
+
 ## Build-system surprises
 
 ### Build cache reuses stale bindings
 
 This often happens when you edit a `.wit` file in a `deps/` directory.
-The build script registered it with `addDirectoryArg` instead of listing
-files individually. Use the `addWitTreeAsInputs` helper from
-[build-integration.md](build-integration.md). It walks the tree during
-configuration and adds each `.wit` file as an explicit input.
+Passing the directory with `addDirectoryArg` doesn't register the files inside it.
 
-### `error: too few arguments` from `Writer.print`
-
-This is a Zig-side error from your code, not this project. WIT
-identifiers often contain `{` or `}`. These come from inline
-tuple/struct syntax in error messages. Escape them as `{{` and `}}` in a
-`std.fmt` format string. Otherwise, the compile-time format check fails.
-This error also caught the CLI during error-message work.
+Use the `addWitTreeAsInputs` helper from [build-integration.md](build-integration.md).
+It walks the tree during configuration and adds each `.wit` file as an explicit input.

@@ -1,16 +1,15 @@
 # Documentation
 
-`zig-wasi-components` is a WIT-to-Zig code generator.
-It also provides a small runtime for WebAssembly components.
+`zig-wasi-components` turns WIT into Zig bindings.
+It also includes a small runtime for WebAssembly components.
 
-Together, they turn a plain Zig module into a real WebAssembly component.
-Implement your world in Zig, and this project handles the canonical ABI.
-It also handles `cabi_realloc` plumbing and component wrapping.
-The result is a `.component.wasm` accepted by Wasmtime and other component-model runtimes.
+Write your world in a plain Zig module, and the generator and runtime turn it into a real WebAssembly component.
+They handle the canonical ABI, `cabi_realloc`, and component wrapping for you.
+The result is a standard `.component.wasm` that Wasmtime can run and Rust hosts can load.
 
-The docs have ten short, focused pages.
-You do not need to read them in order.
-Choose the entry point that matches your situation.
+These ten short pages each cover one topic.
+You don't need to read them in order.
+Start with whichever one you need.
 
 ## Start here
 
@@ -21,36 +20,36 @@ Choose the entry point that matches your situation.
 
 ## Reference
 
-- [Generated bindings](bindings.md): the file that `gen` produces.
+- [Generated bindings](bindings.md): what's in the file that `gen` produces.
   It covers the `wit_exports` convention and the complete WIT-to-Zig mapping.
 - [Resources](resources.md): implement a `resource` type.
   It covers constructors, methods, destructors, and canonical-ABI lifecycle rules.
-- [WASI worlds](wasi.md): work with multi-file WIT trees.
+- [WASI worlds](wasi.md): work with WIT trees spread across multiple files.
   It explains flattening with `wasm-tools component wit` and targets such as `wasi:cli` and `wasi:http`.
 - [The `wasi` convenience module](wasi-module.md): use `zig_wasi_components.wasi` for idiomatic Zig calls.
-  It covers clocks, randomness, stdio, environment, HTTP, and the stream-based `wasi3` counterpart.
+  It covers clocks, randomness, stdio, environment, files, DNS, TCP, HTTP, and the stream-based `wasi3` counterpart.
 - [Build-system integration](build-integration.md): add the codegen and `wasm-tools` pipeline to `build.zig`.
   It includes a complete template.
 
 ## When things go wrong
 
-- [Troubleshooting](troubleshooting.md): common error messages, their meanings, and fixes.
-- [Limitations](limitations.md): intentionally unsupported features and their rationale.
+- [Troubleshooting](troubleshooting.md): common error messages, what they mean, and how to fix them.
+- [Limitations](limitations.md): known gaps and why they remain.
   Read it before opening an issue.
 
 ## What this project is, in one paragraph
 
-The build pipeline matches the one that `cargo-component` uses for Rust.
-`zig_wasi_components gen world.wit <world-name>` reads a parsed WIT schema.
-It emits one Zig file, usually named `bindings.zig`.
+The build works the same way as `cargo-component` does for Rust.
+`zig_wasi_components gen world.wit <world-name>` parses a WIT file and writes one Zig file, usually named `bindings.zig`.
 
-That file contains the following items:
+Here's what's in that file:
 
-- Typed `extern` declarations for every world import.
-- `export` thunks that unpack canonical-ABI arguments and call `wit_exports`.
-- The `cabi_realloc` and `cabi_post_*` symbols required by the host.
 - Zig structs, unions, and enums for every WIT type.
+- Typed Zig wrappers for every import, sync or async.
+- `export` thunks that unpack canonical-ABI arguments and call your `wit_exports`.
+- The `cabi_realloc` and `cabi_post_*` symbols the host needs.
+- Stream and future operations for the functions that use them.
 
 Compile that file and your implementation for `wasm32-freestanding`.
 Pass the core module to `wasm-tools component embed` and `wasm-tools component new`.
-The result interoperates with Rust hosts, Wasmtime CLI calls, and other component-model runtimes.
+You can use the result with Rust hosts and the Wasmtime CLI.

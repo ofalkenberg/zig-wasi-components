@@ -1,7 +1,5 @@
-//! `zig-wit` CLI: parse a WIT file and print a summary of the AST.
-//!
-//! Will eventually grow into a code-generator (`zig-wit gen world.wit
-//! -o bindings.zig`). For now it is enough to demonstrate the parser.
+//! The `zig_wasi_components` CLI: `dump` summarizes a parsed WIT file and
+//! `gen` writes Zig bindings for one of its worlds to stdout.
 
 const std = @import("std");
 const Io = std.Io;
@@ -100,8 +98,8 @@ pub fn main(init: std.process.Init) !void {
 
             if (pkg.worlds.len == 0) {
                 try err.print(
-                    "       this file declares no worlds — only interfaces and/or types.\n" ++
-                        "       'gen' needs a `world <name> {{ … }}` declaration; try `dump` to inspect the file.\n",
+                    "       this file declares no worlds, only interfaces and/or types.\n" ++
+                        "       'gen' needs a `world <name> {{ ... }}` declaration; try `dump` to inspect the file.\n",
                     .{},
                 );
                 if (pkg.interfaces.len != 0) {
@@ -118,7 +116,10 @@ pub fn main(init: std.process.Init) !void {
         try out.writeAll(code);
         return;
     }
-    try out.print("unknown command: {s}\n", .{cmd});
+    var err_buf: [256]u8 = undefined;
+    var err_w: Io.File.Writer = .initStreaming(.stderr(), io, &err_buf);
+    try err_w.interface.print("unknown command: {s}\n", .{cmd});
+    try err_w.interface.flush();
     return error.UnknownCommand;
 }
 

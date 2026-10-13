@@ -163,6 +163,6 @@ fn main() -> Result<()> {
             "(13, 25)".to_string(),
         ],
     );
-    println!("OK — Rust ↔ Zig component interop (both directions) verified.");
+    println!("OK: Rust <-> Zig component interop (both directions) verified.");
     Ok(())
 }

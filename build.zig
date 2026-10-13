@@ -2,8 +2,13 @@ const std = @import("std");
 
 fn addWitTreeAsInputs(b: *std.Build, run: *std.Build.Step.Run, rel_root: []const u8) void {
     const io = b.graph.io;
-    var dir = std.Io.Dir.cwd().openDir(io, rel_root, .{ .iterate = true }) catch |e|
-        std.debug.panic("addWitTreeAsInputs: cannot open '{s}': {t}", .{ rel_root, e });
+    // Resolve against the package root rather than the cwd, so this also
+    // works when another project depends on this package.
+    // A fetched copy ships without examples/; their steps just can't run.
+    var dir = b.root.openDir(io, rel_root, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => std.debug.panic("addWitTreeAsInputs: cannot open '{s}': {t}", .{ rel_root, e }),
+    };
     defer dir.close(io);
     var walker = dir.walk(b.allocator) catch |e|
         std.debug.panic("addWitTreeAsInputs: walker init failed: {t}", .{e});

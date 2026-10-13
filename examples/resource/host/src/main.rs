@@ -36,6 +36,6 @@ fn main() -> Result<()> {
 
     assert_eq!(v1, 17);
     assert_eq!(v2, 150);
-    println!("OK — resource lifecycle (constructor → methods → drop) verified.");
+    println!("OK: resource lifecycle (constructor -> methods -> drop) verified.");
     Ok(())
 }

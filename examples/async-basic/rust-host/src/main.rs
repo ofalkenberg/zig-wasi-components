@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
             assert_eq!(measured, 11);
 
             let relayed = kit.call_relay(accessor, 7).await?;
-            println!("relay(7) = {} (host tick → 70, guest +1 → 71)", relayed);
+            println!("relay(7) = {} (host tick -> 70, guest +1 -> 71)", relayed);
             assert_eq!(relayed, 71);
 
             // Guest produces a stream<u8> with "Hello, <name>!" inside.
