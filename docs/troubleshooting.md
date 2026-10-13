@@ -73,10 +73,25 @@ from io and time types from clocks.
 
 The simplest fix is to copy the dependencies tree from a bundled
 example. `examples/http-get/wit/deps/` has a complete 0.2.6 set. For
-WASI 0.3.0, there is no dependencies tree to assemble.
+WASI 0.3, there is no dependencies tree to assemble.
 `examples/wasi-demo-p3/wit/cli.wit` and `wit-http/http.wit` are single,
 fully resolved files. They contain all six packages inline. You can copy
 them and feed them directly to `gen` and `embed`.
+
+### `module requires an import interface named ...` for an `@unstable` item
+
+The generated bindings include items gated with
+`@unstable(feature = ...)`, such as `wasi:clocks/timezone` in WASI
+0.3.2.
+`wasm-tools component embed` hides those items unless the feature is
+enabled, so the world it embeds no longer contains the interface your
+code calls.
+Pass the feature to `embed`, for example
+`--features clocks-timezone`, or use `--all-features`.
+The host must also provide the interface.
+
+Bindings you never call cost nothing.
+Zig only emits imports for functions that are referenced.
 
 ### `the async canonical option requires an async function type`
 
@@ -148,17 +163,15 @@ then traps.
 ### `instance export ... has the wrong type` / `function implementation is missing`
 
 For a WASI 0.3 component, this is almost always a *version identity*
-mismatch. It is not an encoding bug. Wasmtime 46 and later ship the
-final `0.3.0` interfaces. Components built against final `@0.3.0` run
-as-is. Components built against `@0.3.1` also run through
-semver-compatible resolution. This applies to both `wasmtime run -S p3`
-and `wasmtime serve -S p3,cli`.
+mismatch. It is not an encoding bug. Wasmtime 46 and later link
+WASI 0.3.2 components directly, with both `wasmtime run -S p3` and
+`wasmtime serve -S p3,cli`.
 
 Wasmtime 45 and earlier vendor the `0.3.0-rc-2026-03-15` interfaces.
-Their shapes match final 0.3.0. However, named types such as
+Their shapes match the final release. However, named types such as
 `error-code` carry their interface version in their type identity. A
-final-`@0.3.0` component therefore fails to link every host function
-whose signature mentions one.
+WASI 0.3.2 component therefore fails to link every host function whose
+signature mentions one.
 
 Before suspecting the bindings, compare the version strings. On an old
 runtime, fetch its vendored WIT from

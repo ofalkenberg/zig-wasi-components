@@ -254,24 +254,22 @@ wasmtime run \
 ### The wasi-demo-p3 demo
 
 `wasi-demo-p3` covers the same features through the `wasi3` module.
-It targets the final `wasi:cli/command@0.3.1` world.
+It targets the final `wasi:cli/command@0.3.2` world.
 It covers stream-based stdio, file I/O, and async clock sleeps.
 It also lists a `stream<directory-entry>` and performs DNS.
 
-The build also checks an HTTP guest against `wasi:http/service@0.3.1`.
+The build also checks an HTTP guest against `wasi:http/service@0.3.2`.
 It validates both components with `wasm-tools component new`.
 
 ```sh
 zig build wasi-demo-p3
 ```
 
-Wasmtime 46 and later implement the final WASI 0.3.0 interfaces.
-They link 0.3.1 imports through semver-compatible resolution.
-The demo runs without changes.
+Wasmtime 46 and later run the demo without changes.
 See [the `wasi` module doc](wasi-module.md) for the run command.
 
 Wasmtime 45 and earlier only vendor the March 2026 release candidate.
-They cannot link a final-0.3.x component.
+They cannot link a WASI 0.3.2 component.
 
 ## Where to next
 

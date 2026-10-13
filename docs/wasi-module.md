@@ -177,13 +177,11 @@ Differences from the 0.2 wrapper worth knowing:
   socket (`connectTcp` sets both up; `write`/`readAll`/`close` work as
   before). There is no `instance-network` authority in 0.3.
 
-`examples/wasi-demo-p3/` is a complete `wasi:cli/command@0.3.1`
+`examples/wasi-demo-p3/` is a complete `wasi:cli/command@0.3.2`
 component exercising the module (`zig build wasi-demo-p3`; the step
-also builds an http guest against `wasi:http/service@0.3.1` and
+also builds an http guest against `wasi:http/service@0.3.2` and
 validates both with `wasm-tools component new`). Wasmtime 46 and
-later ship the final WASI 0.3.0 interfaces and accept the 0.3.1
-imports through semver-compatible resolution, so the demo runs
-as-is:
+later run the demo as-is:
 
 ```bash
 wasmtime run -S p3,inherit-network=y,allow-ip-name-lookup=y \

@@ -1,5 +1,5 @@
 //! Runtime coverage for the http side of `wasi3` against the real
-//! `wasi:http/service@0.3.0` world. `handle` answers every request
+//! `wasi:http/service@0.3.2` world. `handle` answers every request
 //! with a body-less 200 whose headers report the outcome of an
 //! outbound `wasi3.http.fetch` — so one `curl` against
 //! `wasmtime serve -S p3,cli` exercises request drop, the client

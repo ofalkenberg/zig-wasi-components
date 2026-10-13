@@ -1,5 +1,5 @@
 //! Demo guest for the `wasi3` convenience module against the real
-//! WASI 0.3.0 `wasi:cli/command` world: environment, randomness,
+//! WASI 0.3.2 `wasi:cli/command` world: environment, randomness,
 //! clocks (including an async-import sleep), terminal probes, a
 //! filesystem round-trip through stream-based descriptors, a
 //! directory listing lifted from a `stream<directory-entry>`, and a

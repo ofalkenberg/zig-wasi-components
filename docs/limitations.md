@@ -55,7 +55,7 @@ Those operations must interleave.
 Use the state-machine async export form instead.
 See [bindings.md](bindings.md).
 
-For request bodies today, drive `wasi:http/types@0.3.1` through the
+For request bodies today, drive `wasi:http/types@0.3.2` through the
 generated bindings and their `intrinsics_*` namespaces.
 Call them from a state-machine export.
 The 0.2 module's `wasi.http.fetch` still supports bodies.
