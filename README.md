@@ -216,19 +216,9 @@ That naming lets wasmtime wire each function into `canon lift`.
 
 ## What is still ahead
 
-The canonical ABI surface that ships with WIT 0.2.x and 0.3.x is fully
-covered in both directions.
-The items below are corner cases.
-They depend on upstream movement or lack a shipping consumer.
-
-- **`list<T, N>` as a variant case payload** is wired through the ABI
-  in every direction.
-  This includes parameters, return types, record fields, and top-level
-  aliases.
-  It also projects to a single flat slot inside a variant arm.
-  No WASIp2 or WASIp3 interface exercises the projection path.
-  If you build a custom WIT that does, file an issue with the schema.
-  We can then add a real demo.
+The canonical ABI surface of WIT 0.2.x and 0.3.x is covered in both
+directions.
+Two gaps remain:
 
 - **Stream/future intrinsics for sync *exports*.** The per-function
   intrinsics namespaces are generated for imports, imported-resource
@@ -249,13 +239,3 @@ They depend on upstream movement or lack a shipping consumer.
   Sending a body needs the state-machine async export form.
   `wasi3.http.Request` deliberately has no `body` field.
   The missing field makes this gap a compile error.
-
-- **Flags with more than 32 labels.** The canonical-ABI specification
-  caps flags at 32 labels (`assert(0 < n <= 32)` in `CanonicalABI.md`).
-  We follow the specification.
-  We return `error.Unsupported` past that boundary.
-
-- **Multi-named result tuples.** WIT removed this form upstream.
-  The parser rejects `func() -> (a: u32, b: string)`.
-  Modern `wasm-tools` also rejects it.
-  Use a `record` return type.
