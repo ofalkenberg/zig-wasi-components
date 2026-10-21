@@ -13,6 +13,11 @@ A small code generator turns WIT into Zig source, which compiles to
 Then `wasm-tools component embed` and `component new` turn that core module
 into a component.
 
+## License
+
+The generator and runtime are licensed under the [MIT License](LICENSE).
+Generated `bindings.zig` files may be used under the same terms.
+
 ## Documentation
 
 You'll find the full user documentation in [`docs/`](docs/README.md).
